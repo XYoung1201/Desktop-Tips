@@ -12,6 +12,7 @@
 #include <shellapi.h>
 #include <ctime>
 #include <functional>
+#include <commdlg.h>
 #include <regex>
 #include <unordered_map>
 
@@ -29,6 +30,8 @@ namespace fs = std::filesystem;
 #define ID_FONTSIZE_DECREASE 5
 #define ID_SPACING_INCREASE 6
 #define ID_SPACING_DECREASE 7
+#define ID_TEXT_COLOR 8
+#define ID_TODO_CHANGE 9
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -39,6 +42,7 @@ std::string TODO_PATH = "";
 HWND hWnd;
 
 static HFONT g_hFont = NULL;  // Global font handle
+static COLORREF g_textColor = RGB(255,255,255);
 
 #define MAX_LOADSTRING 100
 
@@ -160,6 +164,8 @@ void ShowContextMenu(HWND hwnd) {
     AppendMenu(hMenu, MF_STRING, ID_TRAY_EDIT, "Edit");
     AppendMenu(hMenu, MF_STRING, ID_TRAY_REFRESH, "Refresh");
     AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, "Exit");
+    AppendMenu(hMenu, MF_STRING, ID_TODO_CHANGE, "Change TODO File");
+    AppendMenu(hMenu, MF_STRING, ID_TEXT_COLOR, "Change Text Color...");
     AppendMenu(hMenu, MF_STRING, ID_FONTSIZE_INCREASE, "Font Size +");
     AppendMenu(hMenu, MF_STRING, ID_FONTSIZE_DECREASE, "Font Size -");
     AppendMenu(hMenu, MF_STRING, ID_SPACING_INCREASE, "Spacing Size +");
@@ -185,6 +191,23 @@ void AddTrayIcon(HWND hwnd) {
     lstrcpy(nid.szTip, "Tips");  // 托盘图标提示信息
 
     Shell_NotifyIcon(NIM_ADD, &nid);
+}
+
+void confWrite();
+void ChooseTextColor(HWND hwnd) {
+    CHOOSECOLOR cc = { 0 };
+    static COLORREF customColors[16] = { 0 };
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = hwnd;
+    cc.lpCustColors = customColors;
+    cc.rgbResult = g_textColor;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+    if (ChooseColor(&cc)) {
+        g_textColor = cc.rgbResult;
+        confWrite();  // 保存新的颜色设置
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
 }
 
 // 辅助函数：从文件中读取内容并按行存储到 vector
@@ -224,18 +247,27 @@ void getCurrentWindowPosition(int& x, int& y) {
 static const std::string CONFIG_PATH = "C:\\ProgramData\\DesktopTip\\config";
 static const std::string BASE_PATH = "C:\\PROGRAMDATA\\Desktoptip";
 
-void confWrite(std::string path) {
+void confWrite() {
     int x, y;
     getCurrentWindowPosition(x, y);
-    if (x == 0 && y == 0)
-        return;
+    //if (x == 0 && y == 0)
+    //    return;
     std::ofstream ofs(CONFIG_PATH);
     ofs << "Window_X: " << x << std::endl;
     ofs << "Window_Y: " << y << std::endl;
-    ofs << "TODO_path: " << path << std::endl;
+    ofs << "TODO_path: " << TODO_PATH << std::endl;
+    ofs << "FontHeight: " << fontHeight << std::endl;
+    ofs << "LineHeight: " << lineHeight << std::endl;
+
+    // 保存文本颜色的 R、G、B 分量
+    ofs << "TextColor_R: " << (int)GetRValue(g_textColor) << std::endl;
+    ofs << "TextColor_G: " << (int)GetGValue(g_textColor) << std::endl;
+    ofs << "TextColor_B: " << (int)GetBValue(g_textColor) << std::endl;
 }
 
 // 简单的窗口过程，用于绘制文本
+std::string OpenFileDialog();
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -247,7 +279,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         // Height = -MulDiv(pointSize, GetDeviceCaps(hdc, LOGPIXELSY), 72)
         // For simplicity, assume a fixed size, say 24 points.
         HDC hdc = GetDC(hWnd);
-        fontHeight = MulDiv(18, GetDeviceCaps(hdc, LOGPIXELSY), 72);
         ReleaseDC(hWnd, hdc);
         SetLayeredWindowAttributes(hWnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
         SetTimer(hWnd, 1, 60000, nullptr);
@@ -264,7 +295,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     case WM_MOVE:
     {
-        confWrite(TODO_PATH);
+        confWrite();
         break;
     }
     case WM_PAINT:
@@ -281,7 +312,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             CP_UTF8,       // CharSet
             OUT_TT_PRECIS,    // OutputPrecision
             CLIP_CHARACTER_PRECIS,   // ClipPrecision
-            ANTIALIASED_QUALITY,     // Quality (can use ANTIALIASED_QUALITY)
+            NONANTIALIASED_QUALITY,
             DEFAULT_PITCH | FF_SWISS, // PitchAndFamily
             _T("宋体")            // FaceName
         );
@@ -294,7 +325,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         // Transparent background for text
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
+        SetTextColor(hdc, g_textColor);
 
         std::vector<std::string> lines = ReadLinesFromFile();
 
@@ -335,22 +366,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         if (LOWORD(wParam) == ID_FONTSIZE_INCREASE) {
             fontHeight+=5;
+            confWrite();  // 保存配置
             InvalidateRect(hWnd, nullptr, TRUE); // 清除整个窗口并重绘
         }
         if (LOWORD(wParam) == ID_FONTSIZE_DECREASE) {
             fontHeight-= 5;
+            confWrite();  // 保存配置
             if (fontHeight < 0)
                 fontHeight = 0;
             InvalidateRect(hWnd, nullptr, TRUE); // 清除整个窗口并重绘
         }
         if (LOWORD(wParam) == ID_SPACING_INCREASE) {
             lineHeight+= 5;
+            confWrite();  // 保存配置
             InvalidateRect(hWnd, nullptr, TRUE); // 清除整个窗口并重绘
         }
         if (LOWORD(wParam) == ID_SPACING_DECREASE) {
             lineHeight-= 5;
+            confWrite();  // 保存配置
             if (lineHeight < 0)
                 lineHeight = 0;
+            InvalidateRect(hWnd, nullptr, TRUE); // 清除整个窗口并重绘
+        }
+        if (LOWORD(wParam) == ID_TEXT_COLOR) {
+            ChooseTextColor(hWnd);
+            InvalidateRect(hWnd, nullptr, TRUE); // 清除整个窗口并重绘
+        }
+        if (LOWORD(wParam) == ID_TODO_CHANGE) {
+            TODO_PATH = OpenFileDialog();
+            confWrite();
             InvalidateRect(hWnd, nullptr, TRUE); // 清除整个窗口并重绘
         }
         if (LOWORD(wParam) == ID_TRAY_REFRESH) {
@@ -491,13 +535,6 @@ std::string readConfig()
     return path;
 }
 
-// 写入配置文件：覆盖写入新路径
-void writeConfig(const std::string& todoPath)
-{
-    std::ofstream fout(CONFIG_PATH, std::ios::trunc);
-    if (fout.is_open()) fout << todoPath << std::endl;
-}
-
 // 打开文件夹选择对话框，返回用户选中的路径；若取消则返回空字符串
 std::string browseForFolder()
 {
@@ -546,18 +583,33 @@ void confCreate() {
         fs::create_directories(BASE_PATH);
     // 检查并创建 config 文件
     if (!fs::exists(CONFIG_PATH)) {
-        std::filesystem::path homeDir = std::getenv("OneDrive");
-        TODO_PATH = (homeDir / "Current/TODO.txt").string();
+        //std::filesystem::path homeDir = std::getenv("OneDrive");
+        TODO_PATH = string("TODO.txt");
         std::ofstream ofs(CONFIG_PATH);
+        fontHeight = MulDiv(18, GetDeviceCaps(GetDC(hWnd), LOGPIXELSY), 72);
+        lineHeight = (int)(fontHeight * 1.5);
         ofs << "Window_X: " << 0 << std::endl;
         ofs << "Window_Y: " << 0 << std::endl;
         ofs << "TODO_path: " << TODO_PATH << std::endl;
+        ofs << "FontHeight: " << fontHeight << std::endl;
+        ofs << "LineHeight: " << lineHeight << std::endl;
+
+        // 保存默认文本颜色
+        ofs << "TextColor_R: " << (int)GetRValue(g_textColor) << std::endl;
+        ofs << "TextColor_G: " << (int)GetGValue(g_textColor) << std::endl;
+        ofs << "TextColor_B: " << (int)GetBValue(g_textColor) << std::endl;
     }
 }
 
 void readFromFile(int& x, int& y) {
     std::ifstream ifs(CONFIG_PATH);
     std::string line;
+
+    // 默认颜色分量值（如果配置文件中没有）
+    int r = GetRValue(g_textColor);
+    int g = GetGValue(g_textColor);
+    int b = GetBValue(g_textColor);
+
     while (std::getline(ifs, line)) {
         if (line.find("Window_X:") == 0) {
             x = std::stoi(line.substr(line.find(":") + 2));
@@ -568,19 +620,50 @@ void readFromFile(int& x, int& y) {
         else if (line.find("TODO_path:") == 0) {
             TODO_PATH = line.substr(line.find(":") + 2); // +2 to skip ": "
         }
+        else if (line.find("FontHeight:") == 0) {
+            fontHeight = std::stoi(line.substr(line.find(":") + 2));
+        }
+        else if (line.find("LineHeight:") == 0) {
+            lineHeight = std::stoi(line.substr(line.find(":") + 2));
+        }
+        else if (line.find("TextColor_R:") == 0) {
+            r = std::stoi(line.substr(line.find(":") + 2));
+        }
+        else if (line.find("TextColor_G:") == 0) {
+            g = std::stoi(line.substr(line.find(":") + 2));
+        }
+        else if (line.find("TextColor_B:") == 0) {
+            b = std::stoi(line.substr(line.find(":") + 2));
+        }
     }
+
+    // 重建颜色值
+    g_textColor = RGB(r, g, b);
+
     if (!fs::exists(TODO_PATH)){
-        // 2. 若无有效配置，则检查当前目录是否有 TODO.txt
         std::string localTodo = (std::filesystem::current_path() / "TODO.txt").string();
+        // 2. 若无有效配置，则检查当前目录是否有 TODO.txt
+        // 在 readFromFile 函数中 localTodo 检查后添加如下代码：
         if (std::filesystem::exists(localTodo)) {
             TODO_PATH = localTodo;
+        } else {
+            // 新增：如果 localTodo 不存在，则创建并写入初始内容
+            std::ofstream todoFile(localTodo);
+            if (todoFile.is_open()) {
+                todoFile << "欢迎使用 DesktopTip！\n";
+                todoFile << "你可以在此文件中添加你的待办事项。\n";
+                todoFile << "支持占位符：{{DATE}} {{TIME}} {{WEEK}} {{MONTH}} {{YEAR}}等\n";
+                todoFile << "示例：今天是 {{DATE}}\n";
+                todoFile << "      本周还剩 {{DAYS_LEFT_WEEK}} 天；\n";
+                todoFile << "      本月还剩{{DAYS_LEFT_MONTH}}天；\n";
+                todoFile << "      本年还剩{{DAYS_LEFT_YEAR}}天。\n";
+                todoFile.close();
+            }
+            
         }
-        else {
-            TODO_PATH = OpenFileDialog();
-            writeConfig(TODO_PATH);
-        }
+        TODO_PATH = localTodo;
+        confWrite();
     }
-    confWrite(TODO_PATH);
 }
 
 int APIENTRY _tWinMain(HINSTANCE hInstance,

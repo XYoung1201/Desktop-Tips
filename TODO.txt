@@ -1,0 +1,7 @@
+欢迎使用 DesktopTip！
+你可以在此文件中添加你的待办事项。
+支持占位符：{{DATE}} {{TIME}} {{WEEK}} {{MONTH}} {{YEAR}}等
+示例：今天是 {{DATE}}
+      本周还剩 {{DAYS_LEFT_WEEK}} 天；
+      本月还剩{{DAYS_LEFT_MONTH}}天；
+      本年还剩{{DAYS_LEFT_YEAR}}天。
