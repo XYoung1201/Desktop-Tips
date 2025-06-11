@@ -1,6 +1,6 @@
 # DesktopTip
 
-## Overview (English)
+## Overview
 DesktopTip is a lightweight Windows application that shows a TODO list or custom notes directly on your desktop. The program reads text from a file (TODO.txt by default) and displays it in a small borderless window. Special placeholders such as `{{DATE}}` or `{{TIME}}` are replaced with the current information when rendered. A tray icon allows you to edit the file, refresh the display, adjust font/spacing and more.
 
 ### Features
@@ -19,7 +19,7 @@ DesktopTip is a lightweight Windows application that shows a TODO list or custom
 2. On first launch a default `TODO.txt` will be created with sample placeholders. Edit this file to add your own tasks or notes.
 3. Use the tray icon to modify settings or open the TODO file at any time.
 
-## 中文说明 (Chinese)
+## 中文说明
 DesktopTip 是一个简洁的 Windows 桌面便签程序，用于在桌面显示来自文本文件的内容。程序默认读取 `TODO.txt`，并支持在文本中使用占位符（如 `{{DATE}}`、`{{TIME}}` 等），显示时会被替换成实时信息。系统托盘图标提供编辑、刷新、切换文件、修改字体颜色以及调整字号和行距等功能。
 
 ### 功能
@@ -37,3 +37,6 @@ DesktopTip 是一个简洁的 Windows 桌面便签程序，用于在桌面显示
 1. 运行编译后的 `DesktopTip.exe`；
 2. 首次启动会在程序目录生成默认的 `TODO.txt`，可在其中添加自己的待办或笔记；
 3. 随时通过托盘图标进入菜单调整设置或编辑文件。
+
+### 效果预览
+![image](https://github.com/user-attachments/assets/ffca57aa-430e-41d0-bb73-e0e94afd1651)
