@@ -1,3 +1,6 @@
 ﻿/x64
 /.vs
 /DesktopTip
+
+# macOS build output
+macOS/build/
