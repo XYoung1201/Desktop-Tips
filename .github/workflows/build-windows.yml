@@ -1,0 +1,34 @@
+name: Build Windows (x64)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'DesktopTip.*'
+      - 'Resource.h'
+      - 'framework.h'
+      - 'targetver.h'
+      - '*.ico'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Release|x64
+        # The project targets the v145 toolset (VS 2026); fall back to the toolset installed on the runner.
+        run: msbuild DesktopTip.sln /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+      - name: Package
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter DesktopTip.exe | Where-Object { $_.FullName -match 'x64.Release' } | Select-Object -First 1
+          Write-Host "Found: $($exe.FullName)"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item $exe.FullName dist/DesktopTip.exe
+          Compress-Archive -Path dist/DesktopTip.exe -DestinationPath DesktopTip-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DesktopTip-windows-x64
+          path: DesktopTip-windows-x64.zip
