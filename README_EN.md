@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/XYoung1201/Desktop-Tips/releases/latest"><b>Download for macOS</b></a> ·
+  <a href="https://github.com/XYoung1201/Desktop-Tips/releases/latest"><b>Download for Windows / macOS</b></a> ·
   <a href="#quick-start"><b>Quick start</b></a> ·
   <a href="#todotxt-syntax"><b>TODO syntax</b></a> ·
   <a href="https://github.com/XYoung1201/Desktop-Tips/issues"><b>Issues</b></a>
@@ -62,7 +62,7 @@ It keeps the few things that matter today, plus countdowns and date info, in fro
 | Platform | Requirements | How to get it |
 |---|---|---|
 | macOS | macOS 13+, Apple silicon and Intel (universal) | Download `DesktopTip-macOS.zip` from [Releases](https://github.com/XYoung1201/Desktop-Tips/releases/latest), unzip and open `DesktopTip.app` |
-| Windows | Windows 10 / 11 | Open `DesktopTip.sln` in Visual Studio and build it; see [Build from source](#build-from-source) |
+| Windows | Windows 10 / 11, x64 | Download `DesktopTip-windows-x64.zip` from [Releases](https://github.com/XYoung1201/Desktop-Tips/releases/latest), unzip and run `DesktopTip.exe`; or build it yourself, see [Build from source](#build-from-source) |
 
 The macOS build is ad-hoc signed. If Gatekeeper blocks the first launch, **right-click → Open** in Finder once. There is no Dock icon; a checklist icon appears in the menu bar, and right-clicking the card opens the same menu.
 
@@ -212,7 +212,7 @@ The script builds Apple-silicon and Intel slices (only the host architecture if 
 ### Windows
 
 1. Open `DesktopTip.sln` in Visual Studio 2019 / 2022;
-2. Build the x64 / Release configuration to produce `DesktopTip.exe`;
+2. Build the x64 / Release configuration to produce `DesktopTip.exe` (the `build-windows.yml` GitHub Actions workflow builds the same artifact in the cloud);
 3. Run it. On first launch a default `TODO.txt` is created next to the program.
 
 ## Feedback and contributing

@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/XYoung1201/Desktop-Tips/releases/latest"><b>下载 macOS 版</b></a> ·
+  <a href="https://github.com/XYoung1201/Desktop-Tips/releases/latest"><b>下载 Windows / macOS 版</b></a> ·
   <a href="#快速上手"><b>快速上手</b></a> ·
   <a href="#todotxt-写法"><b>TODO 写法</b></a> ·
   <a href="https://github.com/XYoung1201/Desktop-Tips/issues"><b>问题反馈</b></a>
@@ -62,7 +62,7 @@ DesktopTip 是一个常驻桌面的便签 / 待办小工具。它读取一个普
 | 平台 | 系统要求 | 获取方式 |
 |---|---|---|
 | macOS | macOS 13 及以上，Apple 芯片与 Intel 通用 | 在 [Releases](https://github.com/XYoung1201/Desktop-Tips/releases/latest) 下载 `DesktopTip-macOS.zip`，解压后打开 `DesktopTip.app` |
-| Windows | Windows 10 / 11 | 使用 Visual Studio 打开 `DesktopTip.sln` 自行编译，见[从源码构建](#从源码构建) |
+| Windows | Windows 10 / 11，x64 | 在 [Releases](https://github.com/XYoung1201/Desktop-Tips/releases/latest) 下载 `DesktopTip-windows-x64.zip`，解压后运行 `DesktopTip.exe`；也可自行编译，见[从源码构建](#从源码构建) |
 
 macOS 版为临时（ad-hoc）签名。首次启动如被系统拦截，请在访达中**右键 → 打开**，之后即可正常双击运行。程序没有 Dock 图标，菜单栏右上角会出现一个清单图标，右键卡片同样能调出菜单。
 
@@ -212,7 +212,7 @@ open build/DesktopTip.app
 ### Windows
 
 1. 使用 Visual Studio 2019 / 2022 打开 `DesktopTip.sln`；
-2. 选择 x64 / Release 配置编译，生成 `DesktopTip.exe`；
+2. 选择 x64 / Release 配置编译，生成 `DesktopTip.exe`（仓库的 GitHub Actions 工作流 `build-windows.yml` 也会在云端构建同样的产物）；
 3. 运行即可。首次启动会在程序目录创建默认的 `TODO.txt`。
 
 ## 反馈与贡献
