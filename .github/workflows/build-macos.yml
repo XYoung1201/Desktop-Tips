@@ -1,0 +1,25 @@
+name: Build macOS (universal)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'macOS/**'
+      - 'Tip.png'
+      - '.github/workflows/build-macos.yml'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build DesktopTip.app
+        run: bash macOS/build.sh
+      - name: Package
+        run: |
+          cd macOS/build
+          ditto -c -k --keepParent DesktopTip.app ../../DesktopTip-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DesktopTip-macos
+          path: DesktopTip-macos.zip
