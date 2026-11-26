@@ -21,6 +21,7 @@ struct Config {
     var fontFamily = "PingFang SC"
     var displayMode = 0          // 0 = 附着桌面, 1 = 始终置顶
     var countdownRepeat = false
+    var hoverHide = true         // 始终置顶时鼠标悬停隐藏（按住 ⌘ 可操作）
 
     var textColor: NSColor { NSColor(srgbRed: CGFloat(text.r) / 255, green: CGFloat(text.g) / 255, blue: CGFloat(text.b) / 255, alpha: 1) }
     var bgColor: NSColor { NSColor(srgbRed: CGFloat(bg.r) / 255, green: CGFloat(bg.g) / 255, blue: CGFloat(bg.b) / 255, alpha: 1) }
@@ -50,6 +51,7 @@ struct Config {
             case "FontFamily": if !val.isEmpty, val != "Microsoft YaHei UI" { c.fontFamily = val }
             case "DisplayMode": c.displayMode = n
             case "CountdownRepeat": c.countdownRepeat = n != 0
+            case "HoverHide": c.hoverHide = n != 0
             default: break
             }
         }
@@ -65,6 +67,7 @@ struct Config {
         out += "TextColor_R: \(text.r)\nTextColor_G: \(text.g)\nTextColor_B: \(text.b)\n"
         out += "BgAlpha: \(bgAlpha)\nBgColor_R: \(bg.r)\nBgColor_G: \(bg.g)\nBgColor_B: \(bg.b)\n"
         out += "FontFamily: \(fontFamily)\nDisplayMode: \(displayMode)\nCountdownRepeat: \(countdownRepeat ? 1 : 0)\n"
+        out += "HoverHide: \(hoverHide ? 1 : 0)\n"
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
@@ -551,6 +554,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     var alertSound: Timer?
     var lastMTime: Date?
 
+    // 置顶时鼠标悬停隐藏：鼠标移到卡片上时淡出并忽略鼠标事件（点击穿透到下面的窗口），
+    // 移开后淡入恢复；按住 ⌘ 时保持显示、可正常拖动/勾选/右键。
+    var hoverTimer: Timer?
+    var hoverHidden = false
+    var menuTracking = false
+
     // reminder state
     var armed = false
     var due = Date()
@@ -595,6 +604,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in self?.menuTracking = true }
+        NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in self?.menuTracking = false }
     }
 
     @objc func screensChanged() { clampToScreens() }
@@ -607,6 +618,39 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             window.level = .floating
         } else {
             window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+        }
+        updateHoverHide()
+    }
+
+    // MARK: Hide on hover (always-on-top only)
+    func updateHoverHide() {
+        if cfg.hoverHide && cfg.displayMode == 1 {
+            if hoverTimer == nil {
+                let t = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in self?.hoverTick() }
+                RunLoop.main.add(t, forMode: .common)   // 拖动/菜单跟踪期间也继续检测
+                hoverTimer = t
+            }
+        } else {
+            hoverTimer?.invalidate(); hoverTimer = nil
+            setHoverHidden(false)
+        }
+    }
+
+    func hoverTick() {
+        let inside = window.frame.contains(NSEvent.mouseLocation)
+        let reveal = NSEvent.modifierFlags.contains(.command)
+        // 卡片可见时按着左键（正在拖动卡片）不隐藏
+        let dragging = !hoverHidden && (NSEvent.pressedMouseButtons & 1) != 0
+        setHoverHidden(inside && !reveal && !dragging && !menuTracking)
+    }
+
+    func setHoverHidden(_ hidden: Bool) {
+        guard hidden != hoverHidden else { return }
+        hoverHidden = hidden
+        window.ignoresMouseEvents = hidden
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            self.window.animator().alphaValue = hidden ? 0 : 1
         }
     }
 
@@ -699,6 +743,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let mode = NSMenu()
         add(mode, "附着桌面  Attach to desktop", #selector(setMode(_:)), 0, checked: cfg.displayMode == 0)
         add(mode, "始终置顶  Always on top", #selector(setMode(_:)), 1, checked: cfg.displayMode == 1)
+        mode.addItem(.separator())
+        add(mode, "置顶时鼠标悬停隐藏（按住 ⌘ 可操作）  Hide on hover when on top", #selector(toggleHoverHide), checked: cfg.hoverHide)
         let mi = NSMenuItem(title: "显示模式  Display mode", action: nil, keyEquivalent: ""); mi.submenu = mode; m.addItem(mi)
         m.addItem(.separator())
         add(m, "编辑 TODO  Edit", #selector(editTodoAction))
@@ -716,6 +762,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         settings?.show(near: p)
     }
     @objc func setMode(_ s: NSMenuItem) { cfg.displayMode = s.tag; applyMode(); saveConfig(); window.orderFrontRegardless() }
+    @objc func toggleHoverHide() { cfg.hoverHide.toggle(); updateHoverHide(); saveConfig() }
     @objc func refreshAction() { refresh(force: true) }
     @objc func editTodoAction() { editTodo() }
     func editTodo() { NSWorkspace.shared.open(URL(fileURLWithPath: cfg.todoPath)) }
