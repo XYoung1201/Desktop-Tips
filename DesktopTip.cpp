@@ -67,10 +67,17 @@ using namespace std::chrono;
 #define ID_COUNTDOWN_1HOUR 23
 #define ID_COUNTDOWN_REPEAT 24
 #define ID_HOVER_HIDE 25
+// 单项任务计时（右键某条待办）
+#define ID_TASK_CD_FIRST 101      // 101..108 = 预设倒计时
+#define ID_TASK_CD_CUSTOM 110
+#define ID_TASK_STOPWATCH 111
+#define ID_TASK_PAUSE 112
+#define ID_TASK_RESTART 113
+#define ID_TASK_REMOVE 114
 
 #define TIMER_REFRESH 1
 #define TIMER_REMINDER_CHECK 2
-#define TIMER_REMINDER_ANIMATE 3
+#define TIMER_ANIM 3
 #define TIMER_HOVER_HIDE 4
 
 #define WM_REMINDER_STOP (WM_APP + 1)
@@ -105,9 +112,17 @@ static bool g_hasLastContextMenuPt = false;
 struct TodoHitRect {
     RECT rc;
     int sourceIndex;
+    std::wstring key;       // 任务文本（去掉 "- " 与 "_OK"），用作计时器的键
+    bool completed;
 };
 
-static std::vector<TodoHitRect> g_todoHitRects;
+static std::vector<TodoHitRect> g_todoHitRects;   // 复选框
+static std::vector<TodoHitRect> g_rowHitRects;    // 整行（右键为该任务设置计时）
+static std::vector<TodoHitRect> g_pillHitRects;   // 计时胶囊（单击暂停/继续）
+
+struct BannerButton { RECT rc; int action; };
+enum { BANNER_DONE = 1, BANNER_SNOOZE = 2, BANNER_DISMISS = 3 };
+static std::vector<BannerButton> g_bannerButtons;
 
 static bool g_reminderArmed = false;
 static system_clock::time_point g_reminderDue;
@@ -122,25 +137,52 @@ static bool g_restoringAlert = false;
 static steady_clock::time_point g_alertStarted;
 static std::wstring g_alertTitle;
 static std::wstring g_alertDetail;
-static RECT g_alertSavedRect = { 0, 0, 0, 0 };
-static int g_alertSavedFontHeight = 10;
-static int g_alertSavedLineHeight = 30;
-static int g_alertSavedBgAlpha = 128;
-static COLORREF g_alertSavedTextColor = RGB(244, 245, 248);
-static COLORREF g_alertSavedBgColor = RGB(20, 25, 35);
-static double g_alertX = 0.0;
-static double g_alertY = 0.0;
-static double g_alertVx = 0.0;
-static double g_alertVy = 0.0;
-static steady_clock::time_point g_alertLastFrame;
-static steady_clock::time_point g_alertNextFontChange;
-static std::wstring g_alertFontFamily;
-static double g_alertCardW = 320.0;
-static double g_alertCardH = 180.0;
+static std::wstring g_alertTaskKey;          // 触发提醒的任务；空 = 全局倒计时/闹钟
 static std::vector<std::wstring> g_systemFonts;
-static HHOOK g_keyboardHook = NULL;
-static std::mt19937 g_rng((unsigned)steady_clock::now().time_since_epoch().count());
 
+// ---- 每项任务的计时器（倒计时 / 正计时）----
+// 保存在 C:\ProgramData\DesktopTip\timers，每行：kind\tduration\tstart\taccum\tfired\t任务文本
+// kind: down = 倒计时, up = 正计时；start 为本次开始计时的 Unix 秒（0 = 暂停中）；accum 为此前累计秒数。
+struct TaskTimer {
+    bool countdown = true;
+    long long duration = 0;
+    long long start = 0;
+    long long accum = 0;
+    bool fired = false;
+    std::wstring key;
+};
+static std::vector<TaskTimer> g_taskTimers;
+static bool g_taskTimersLoaded = false;
+static std::wstring g_menuTaskKey;           // 右键菜单所针对的任务
+
+// ---- 动画 ----
+// 完成动画：勾选后复选框弹出填充 → 对勾描绘 → 涟漪与光点 → 删除线划过，结束后才写回文件；
+// 写回后已完成项沉底，各行从旧位置平滑滑到新位置（settle）。
+static const double COMPLETE_ANIM_SEC = 0.70;
+static const double SETTLE_ANIM_SEC = 0.32;
+struct CompleteAnim {
+    bool active = false;
+    int sourceIndex = -1;
+    std::wstring key;
+    steady_clock::time_point start;
+};
+static CompleteAnim g_completeAnim;
+static std::unordered_map<std::wstring, float> g_lastRowY;     // 上一帧各待办行的 y
+static std::unordered_map<std::wstring, float> g_settleFrom;   // 滑动起点
+static bool g_settling = false;
+static steady_clock::time_point g_settleStart;
+static std::wstring g_justCompletedKey;                        // 刚完成的项：滑动期间从强调色淡出
+static bool g_animTimerOn = false;
+static UINT g_animTimerInterval = 0;
+
+// ---- 到点抖动 ----
+static const double SHAKE_SEC = 0.75;
+static const int SHAKE_REPEAT_SEC = 6;     // 未处理时每 6 秒再抖一次
+static const int SHAKE_MAX_TIMES = 6;
+static bool g_shaking = false;
+static steady_clock::time_point g_shakeStart;
+static POINT g_shakeBase = { 0, 0 };
+static int g_shakeTimes = 0;
 // 置顶时鼠标悬停隐藏：
 //   在「始终置顶」模式下，鼠标移到卡片上时卡片淡出并变为鼠标穿透(WS_EX_TRANSPARENT)，
 //   这样既能常驻最上层，又不会挡住下面窗口的关键信息/点击；鼠标移开后自动淡入恢复。
@@ -152,79 +194,6 @@ static int  g_hoverAlpha = 255;          // 卡片整体不透明度（用于淡
 static bool g_contextMenuOpen = false;   // 右键菜单弹出期间不隐藏
 static const int HOVER_HIDE_POLL_MS = 30;
 static const int HOVER_HIDE_FADE_STEP = 64;   // 每次 tick 的 alpha 变化量（约 120ms 完成淡入/淡出）
-
-// 黑洞提醒效果：倒计时/闹钟触发后，先捕获当前页面/桌面作为“采样源”，
-// 但不再把原始页面整张画回输出层。最终输出层只画被黑洞偏折后的像素、
-// 吸积盘、光子环和事件视界；影响范围之外保持透明，让下面的真实页面自然可见。
-static std::vector<BYTE> g_blackholeBg; // captured desktop, BGRA, top-down, sampling source only
-static int g_blackholeW = 0;
-static int g_blackholeH = 0;
-static int g_blackholeVX = 0;
-static int g_blackholeVY = 0;
-static bool g_blackholeBgReady = false;
-static unsigned long long g_blackholeBgSerial = 0;
-
-// Distortion-only mode knobs.
-// SourceConstantAlpha stays at 255; visibility is controlled by per-pixel alpha.
-// The original page is used only as a texture source for displaced samples, not as a base layer.
-static const BYTE   BH_ALERT_LAYER_ALPHA = 255;          // keep 255; per-pixel alpha controls visibility
-static const double BH_DISTORTION_ALPHA_GAIN = 1.18;     // opacity of the warped samples, 0.0..2.0
-static const double BH_DISTORTION_MAX_ALPHA = 0.96;      // keep <1 near edge for a softer overlay
-static const double BH_EVENT_HORIZON_OPACITY = 1.00;     // black circle darkness, 0.0..1.0
-static const double BH_EVENT_HORIZON_RADIUS_SCALE = 1.18;
-// The edge renders an aligned captured-base color that eases to the real desktop
-// under the layered window. This keeps the outer transition visually registered
-// with the bottom image while the inner field still shows lensing and darkness.
-static const double BH_FIELD_FEATHER_START = 0.64;   // lower = wider aligned transition band
-static const double BH_FIELD_ALPHA_POWER = 1.55;     // >1 makes the outer edge less visible
-static const double BH_DARK_CORE_END = 0.42;         // dark carrier fully active only in the inner core
-static const double BH_DARK_FEATHER_END = 0.68;      // dark carrier fades before the boundary alignment band
-static const double BH_LOCAL_FIELD_TINT_R = 0.002;   // very dark carrier, not the page image
-static const double BH_LOCAL_FIELD_TINT_G = 0.004;
-static const double BH_LOCAL_FIELD_TINT_B = 0.010;
-static const double BH_LOCAL_FIELD_VIGNETTE = 0.20;  // local gravitational well darkness
-static const double BH_WARP_VIS_GAIN = 1.10;         // visual strength of warped samples
-
-struct BlackHoleInstance {
-    double cx = 0.5;
-    double cy = 0.5;
-    double moveVx = 0.0;
-    double moveVy = 0.0;
-    double moveAmpX = 0.0;
-    double moveAmpY = 0.0;
-    double movePeriodX = 7.0;
-    double movePeriodY = 8.0;
-    double movePhaseX = 0.0;
-    double movePhaseY = 0.0;
-    double minRh = 0.014;
-    double maxRh = 0.024;
-    double maxEffectR = 0.10;
-    double period = 4.0;
-    double phase = 0.0;
-    double roll = 0.35;
-    double incl = 1.5;
-    double diskSpeed = 5.0;
-    double seed = 0.0;
-};
-
-static std::vector<BlackHoleInstance> g_blackHoles;
-
-// CPU/GDI fallback render cache for the full-screen black-hole alert.
-// The window remains a layered topmost popup, but the expensive HDC/HBITMAP/DIB allocation
-// is reused across animation frames. Each frame clears only the previous/current dirty
-// rectangle to transparent and then redraws the current black-hole distortion region.
-static HDC g_blackholeRenderDC = NULL;
-static HBITMAP g_blackholeRenderBitmap = NULL;
-static HBITMAP g_blackholeRenderOldBitmap = NULL;
-static void* g_blackholeRenderBits = nullptr;
-static int g_blackholeRenderW = 0;
-static int g_blackholeRenderH = 0;
-static int g_blackholeRenderVX = 0;
-static int g_blackholeRenderVY = 0;
-static bool g_blackholeFrameInitialized = false;
-static unsigned long long g_blackholeFrameBgSerial = 0;
-static RECT g_blackholePrevDirty = { 0, 0, 0, 0 };
-static bool g_blackholePrevDirtyValid = false;
 
 #define MAX_LOADSTRING 100
 
@@ -575,30 +544,6 @@ static int HitTestTodoCheckbox(int x, int y)
     return -1;
 }
 
-static bool ToggleTodoAtPoint(HWND hwnd, int x, int y)
-{
-    int sourceIndex = HitTestTodoCheckbox(x, y);
-    if (sourceIndex < 0) return false;
-    if (ToggleTodoLineCompletion(sourceIndex)) {
-        RenderTip(hwnd);
-    }
-    return true;
-}
-
-static int RandInt(int lo, int hi)
-{
-    if (hi < lo) hi = lo;
-    std::uniform_int_distribution<int> dist(lo, hi);
-    return dist(g_rng);
-}
-
-static double RandDouble(double lo, double hi)
-{
-    if (hi < lo) hi = lo;
-    std::uniform_real_distribution<double> dist(lo, hi);
-    return dist(g_rng);
-}
-
 static double ClampDouble(double value, double lo, double hi)
 {
     if (hi < lo) hi = lo;
@@ -610,37 +555,6 @@ static double ClampDouble(double value, double lo, double hi)
 static int ClampByte(double value)
 {
     return (int)ClampDouble(value + 0.5, 0.0, 255.0);
-}
-
-static double PingPong01(double elapsedSeconds, double periodSeconds)
-{
-    if (periodSeconds <= 0.0) return 0.0;
-    double phase = std::fmod(elapsedSeconds, periodSeconds) / periodSeconds;
-    return phase < 0.5 ? phase * 2.0 : (1.0 - phase) * 2.0;
-}
-
-static COLORREF HsvToRgb(double hue, double saturation, double value)
-{
-    hue = std::fmod(hue, 360.0);
-    if (hue < 0.0) hue += 360.0;
-    saturation = ClampDouble(saturation, 0.0, 1.0);
-    value = ClampDouble(value, 0.0, 1.0);
-
-    double c = value * saturation;
-    double x = c * (1.0 - std::fabs(std::fmod(hue / 60.0, 2.0) - 1.0));
-    double m = value - c;
-    double r = 0.0, g = 0.0, b = 0.0;
-
-    if (hue < 60.0) { r = c; g = x; }
-    else if (hue < 120.0) { r = x; g = c; }
-    else if (hue < 180.0) { g = c; b = x; }
-    else if (hue < 240.0) { g = x; b = c; }
-    else if (hue < 300.0) { r = x; b = c; }
-    else { r = c; b = x; }
-
-    return RGB(ClampByte((r + m) * 255.0),
-        ClampByte((g + m) * 255.0),
-        ClampByte((b + m) * 255.0));
 }
 
 static int CALLBACK EnumSystemFontProc(const LOGFONTW* lf, const TEXTMETRICW*, DWORD, LPARAM lParam)
@@ -672,15 +586,6 @@ static void EnsureSystemFontsLoaded()
         g_systemFonts.push_back(L"Segoe UI");
         g_systemFonts.push_back(L"Arial");
     }
-}
-
-static void PickRandomAlertFont()
-{
-    EnsureSystemFontsLoaded();
-    if (!g_systemFonts.empty()) {
-        g_alertFontFamily = g_systemFonts[(size_t)RandInt(0, (int)g_systemFonts.size() - 1)];
-    }
-    g_alertNextFontChange = steady_clock::now() + milliseconds(RandInt(55, 130));
 }
 
 static std::wstring TrimCopy(const std::wstring& text)
@@ -985,154 +890,492 @@ static void TickHoverHide(HWND hwnd)
     }
 }
 
-static void InstallReminderKeyboardHook();
-static void StopReminderAlert(HWND hwnd);
-static void CaptureBlackHoleBackground(HWND hwnd);
-static void ResetBlackHoleAlertState();
-static void InitBlackHoleInstances(int W, int H);
-static void EnsureBlackHoleWindowBounds(HWND hwnd);
-static void RenderBlackHoleAlert(HWND hwnd);
+// ============================================================================
+//  每项任务的计时器（倒计时 / 正计时）
+// ============================================================================
+static const char* TIMERS_DIR = "C:\\ProgramData\\DesktopTip";
+static const char* TIMERS_PATH = "C:\\ProgramData\\DesktopTip\\timers";
+static const int kTaskPresetMinutes[] = { 5, 10, 15, 25, 30, 45, 60, 90 };
+static const int kTaskPresetCount = (int)(sizeof(kTaskPresetMinutes) / sizeof(kTaskPresetMinutes[0]));
 
-static std::vector<std::wstring> BuildReminderAlertLines()
+static long long NowEpoch() { return (long long)std::time(nullptr); }
+
+static long long TimerElapsed(const TaskTimer& t)
+{
+    long long e = t.accum + (t.start > 0 ? NowEpoch() - t.start : 0);
+    return e < 0 ? 0 : e;
+}
+
+static void LoadTaskTimers()
+{
+    g_taskTimersLoaded = true;
+    g_taskTimers.clear();
+    std::ifstream f(TIMERS_PATH, std::ios::binary);
+    if (!f.is_open()) return;
+    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (const auto& line : SplitLinesW(DecodeAutoToUtf16(bytes))) {
+        std::vector<std::wstring> p = SplitWide(line, L'\t');
+        if (p.size() < 6) continue;
+        TaskTimer t;
+        t.countdown = (p[0] == L"down");
+        try {
+            t.duration = std::stoll(p[1]);
+            t.start = std::stoll(p[2]);
+            t.accum = std::stoll(p[3]);
+        } catch (...) { continue; }
+        t.fired = (p[4] == L"1");
+        std::wstring key = p[5];
+        for (size_t k = 6; k < p.size(); ++k) key += L"\t" + p[k];
+        if (key.empty()) continue;
+        t.key = key;
+        g_taskTimers.push_back(t);
+    }
+}
+
+static void SaveTaskTimers()
+{
+    std::error_code ec;
+    fs::create_directories(TIMERS_DIR, ec);
+    std::ofstream f(TIMERS_PATH, std::ios::binary | std::ios::trunc);
+    if (!f.is_open()) return;
+    for (const auto& t : g_taskTimers) {
+        std::ostringstream o;
+        o << (t.countdown ? "down" : "up") << '\t' << t.duration << '\t' << t.start << '\t'
+          << t.accum << '\t' << (t.fired ? 1 : 0) << '\t' << WideToUtf8(t.key) << '\n';
+        f << o.str();
+    }
+}
+
+static TaskTimer* FindTaskTimer(const std::wstring& key)
+{
+    if (!g_taskTimersLoaded) LoadTaskTimers();
+    for (auto& t : g_taskTimers) {
+        if (t.key == key) return &t;
+    }
+    return nullptr;
+}
+
+static TaskTimer& EnsureTaskTimer(const std::wstring& key)
+{
+    if (TaskTimer* t = FindTaskTimer(key)) return *t;
+    TaskTimer t;
+    t.key = key;
+    g_taskTimers.push_back(t);
+    return g_taskTimers.back();
+}
+
+static bool AnyTaskTimerRunning()
+{
+    if (!g_taskTimersLoaded) LoadTaskTimers();
+    for (const auto& t : g_taskTimers) {
+        if (t.start > 0) return true;
+    }
+    return false;
+}
+
+static void StartTaskCountdown(const std::wstring& key, long long seconds)
+{
+    TaskTimer& t = EnsureTaskTimer(key);
+    t.countdown = true;
+    t.duration = seconds;
+    t.accum = 0;
+    t.start = NowEpoch();
+    t.fired = false;
+    SaveTaskTimers();
+}
+
+static void StartTaskStopwatch(const std::wstring& key)
+{
+    TaskTimer& t = EnsureTaskTimer(key);
+    t.countdown = false;
+    t.duration = 0;
+    t.accum = 0;
+    t.start = NowEpoch();
+    t.fired = false;
+    SaveTaskTimers();
+}
+
+static void PauseTaskTimer(TaskTimer& t)
+{
+    if (t.start > 0) {
+        t.accum = TimerElapsed(t);
+        t.start = 0;
+    }
+}
+
+static void ToggleTaskTimerPause(const std::wstring& key)
+{
+    TaskTimer* t = FindTaskTimer(key);
+    if (!t) return;
+    if (t->start > 0) PauseTaskTimer(*t);
+    else t->start = NowEpoch();
+    SaveTaskTimers();
+}
+
+static void RestartTaskTimer(const std::wstring& key)
+{
+    TaskTimer* t = FindTaskTimer(key);
+    if (!t) return;
+    t->accum = 0;
+    t->start = NowEpoch();
+    t->fired = false;
+    SaveTaskTimers();
+}
+
+static void RemoveTaskTimer(const std::wstring& key)
+{
+    if (!g_taskTimersLoaded) LoadTaskTimers();
+    g_taskTimers.erase(std::remove_if(g_taskTimers.begin(), g_taskTimers.end(),
+        [&](const TaskTimer& t) { return t.key == key; }), g_taskTimers.end());
+    SaveTaskTimers();
+}
+
+// 「再等 N 分钟」：把倒计时延长到“从现在起还剩 N 秒”，并继续计时
+static void SnoozeTaskTimer(const std::wstring& key, long long seconds)
+{
+    TaskTimer* t = FindTaskTimer(key);
+    if (!t) return;
+    long long el = TimerElapsed(*t);
+    t->countdown = true;
+    t->duration = el + seconds;
+    if (t->start == 0) t->start = NowEpoch();
+    t->fired = false;
+    SaveTaskTimers();
+}
+
+// 计时显示：mm:ss 或 h:mm:ss
+static std::wstring FormatClock(long long s)
+{
+    if (s < 0) s = 0;
+    wchar_t buf[32];
+    long long h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
+    if (h > 0) swprintf(buf, 32, L"%lld:%02lld:%02lld", h, m, sec);
+    else swprintf(buf, 32, L"%02lld:%02lld", m, sec);
+    return buf;
+}
+
+static std::wstring FormatShortDuration(long long s)
+{
+    wchar_t buf[64];
+    if (s < 60) swprintf(buf, 64, L"%lld 秒", s);
+    else if (s % 60 != 0) swprintf(buf, 64, L"%lld 分 %lld 秒", s / 60, s % 60);
+    else {
+        long long m = s / 60;
+        if (m < 60) swprintf(buf, 64, L"%lld 分钟", m);
+        else if (m % 60 == 0) swprintf(buf, 64, L"%lld 小时", m / 60);
+        else swprintf(buf, 64, L"%lld 小时 %lld 分钟", m / 60, m % 60);
+    }
+    return buf;
+}
+
+static std::wstring TodoKeyOfLine(const std::wstring& line, bool* completed)
+{
+    std::wstring text;
+    if (!ParseTodoLineState(line, &text, completed)) return L"";
+    return TrimCopy(text);
+}
+
+// 按任务文本切换完成状态（sourceIndex 只是提示，文件期间被改过也能找到正确的行）
+static bool ToggleTodoByKey(int sourceIndex, const std::wstring& key)
 {
     std::vector<std::wstring> lines;
-    lines.push_back(L"# " + g_alertTitle);
-    if (!g_alertDetail.empty()) {
-        lines.push_back(L"> " + g_alertDetail);
-    }
-    auto elapsed = duration_cast<seconds>(steady_clock::now() - g_alertStarted).count();
-    lines.push_back(elapsed >= 10 ? L"- 按任意键停止提醒" : L"- 10 秒后按任意键停止");
-    return lines;
-}
-
-static LRESULT CALLBACK ReminderKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
-{
-    if (code == HC_ACTION && g_alertActive &&
-        (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-        auto elapsed = duration_cast<milliseconds>(steady_clock::now() - g_alertStarted).count();
-        if (elapsed >= 10000 && hWnd) {
-            PostMessageW(hWnd, WM_REMINDER_STOP, 0, 0);
+    if (!ReadTodoFileLinesW(lines)) return false;
+    int idx = -1;
+    if (sourceIndex >= 0 && (size_t)sourceIndex < lines.size() &&
+        IsTodoLine(lines[(size_t)sourceIndex]) && TodoKeyOfLine(lines[(size_t)sourceIndex], nullptr) == key) {
+        idx = sourceIndex;
+    } else {
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (IsTodoLine(lines[i]) && TodoKeyOfLine(lines[i], nullptr) == key) { idx = (int)i; break; }
         }
     }
-    return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
+    if (idx < 0) return false;
+    return ToggleTodoLineCompletion(idx);
 }
 
-static void InstallReminderKeyboardHook()
+// ============================================================================
+//  到点提醒：卡片升到最前端 + 抖动 + 卡片顶部的提醒横幅（替代原先的全屏黑洞动画）
+//  提醒期间暂停「悬停隐藏」，保证卡片可见、可点击；处理后恢复原显示模式。
+// ============================================================================
+static void SetAnimTimer(HWND hwnd);
+static void BeginToggle(HWND hwnd, const TodoHitRect& hit);
+
+static void RaiseForAlert(HWND hwnd)
 {
-    if (!g_keyboardHook) {
-        g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, ReminderKeyboardProc,
-            GetModuleHandle(NULL), 0);
-    }
-}
-
-static void UninstallReminderKeyboardHook()
-{
-    if (g_keyboardHook) {
-        UnhookWindowsHookEx(g_keyboardHook);
-        g_keyboardHook = NULL;
-    }
-}
-
-static double RandomSignedSpeed(double lo, double hi)
-{
-    double speed = RandDouble(lo, hi);
-    return RandInt(0, 1) == 0 ? -speed : speed;
-}
-
-static void StartReminderAlert(HWND hwnd, const std::wstring& title, const std::wstring& detail)
-{
-    if (g_alertActive) return;
-    ResetHoverHide(hwnd);   // 提醒全屏动画期间不做悬停隐藏/穿透
-    g_alertActive = true;
-    g_alertStarted = steady_clock::now();
-    g_alertLastFrame = g_alertStarted;
-    g_alertTitle = title;
-    g_alertDetail = detail;
-    GetWindowRect(hwnd, &g_alertSavedRect);
-    g_alertSavedFontHeight = fontHeight;
-    g_alertSavedLineHeight = lineHeight;
-    g_alertSavedBgAlpha = g_bgAlpha;
-    g_alertSavedTextColor = g_textColor;
-    g_alertSavedBgColor = g_bgColor;
-
-    // 先把原便签临时隐藏并截取桌面，作为黑洞 shader 的 iChannel0。
-    // 这样透镜区域采样的是倒计时结束那一刻的桌面，而不是上一帧黑洞自身。
-    CaptureBlackHoleBackground(hwnd);
-    InitBlackHoleInstances(GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
-
     if (GetParent(hwnd) != NULL) {
         g_reparenting = true;
         SetParent(hwnd, NULL);
         g_reparenting = false;
     }
-    SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);
-
-    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-    style &= ~WS_CHILD;
-    style |= WS_POPUP;
-    SetWindowLongPtr(hwnd, GWL_STYLE, style);
-
+    SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);   // 解除与桌面层的 owner 关系，才能浮到最上层
     LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
     ex |= WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
     SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
-    EnsureBlackHoleWindowBounds(hwnd);
     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-
-    InstallReminderKeyboardHook();
-    SetTimer(hwnd, TIMER_REMINDER_ANIMATE, 16, nullptr);
-    RenderTip(hwnd);
 }
 
-static void AnimateReminderAlert(HWND hwnd)
+static void StartShake(HWND hwnd)
 {
-    if (!g_alertActive) return;
-
-    auto now = steady_clock::now();
-    double dt = duration<double>(now - g_alertLastFrame).count();
-    if (dt <= 0.0) dt = 0.016;
-    if (dt > 0.10) dt = 0.10;
-    g_alertLastFrame = now;
-
-    EnsureBlackHoleWindowBounds(hwnd);
-    RenderTip(hwnd);
-}
-
-static void StopReminderAlert(HWND hwnd)
-{
-    if (!g_alertActive) return;
-
-    g_restoringAlert = true;
-    KillTimer(hwnd, TIMER_REMINDER_ANIMATE);
-    UninstallReminderKeyboardHook();
-
-    fontHeight = g_alertSavedFontHeight;
-    lineHeight = g_alertSavedLineHeight;
-    g_bgAlpha = g_alertSavedBgAlpha;
-    g_textColor = g_alertSavedTextColor;
-    g_bgColor = g_alertSavedBgColor;
-    g_alertFontFamily.clear();
-    g_alertActive = false;
-
-    if (GetParent(hwnd) != NULL) {
-        g_reparenting = true;
-        SetParent(hwnd, NULL);
-        g_reparenting = false;
+    if (g_dragging) return;
+    if (!g_shaking) {
+        RECT wr; GetWindowRect(hwnd, &wr);
+        g_shakeBase = { wr.left, wr.top };
     }
-    SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);
-    LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-    ex |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
-    SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
-    SetWindowPos(hwnd, HWND_TOPMOST, g_alertSavedRect.left, g_alertSavedRect.top, 0, 0,
-        SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    g_shaking = true;
+    g_shakeStart = steady_clock::now();
+    g_shakeTimes++;
+    MessageBeep(MB_ICONEXCLAMATION);
+}
+
+static void StopShake(HWND hwnd)
+{
+    if (!g_shaking) return;
+    g_shaking = false;
+    SetWindowPos(hwnd, NULL, g_shakeBase.x, g_shakeBase.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void TickShake(HWND hwnd)
+{
+    if (!g_shaking) return;
+    if (g_dragging) { g_shaking = false; return; }   // 用户开始拖动：不再拉回
+    double t = duration<double>(steady_clock::now() - g_shakeStart).count();
+    if (t >= SHAKE_SEC) { StopShake(hwnd); return; }
+    double base = (double)(fontHeight > 8 ? fontHeight : 24);
+    double amp = (std::max)(10.0, base * 0.6);
+    double k = 1.0 - t / SHAKE_SEC;                     // 衰减包络，收尾柔和
+    int dx = (int)std::lround(amp * k * k * std::sin(2.0 * 3.14159265358979 * 7.5 * t));
+    SetWindowPos(hwnd, NULL, g_shakeBase.x + dx, g_shakeBase.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void StartCardAlert(HWND hwnd, const std::wstring& title, const std::wstring& detail, const std::wstring& taskKey)
+{
+    g_alertTitle = title;
+    g_alertDetail = detail;
+    g_alertTaskKey = taskKey;
+    g_alertStarted = steady_clock::now();
+    g_shakeTimes = 0;
+    if (!g_alertActive) {
+        g_alertActive = true;
+        ResetHoverHide(hwnd);   // 覆盖悬停隐藏：立即完全显示且可点击
+    }
+    RaiseForAlert(hwnd);
+    StartShake(hwnd);
+    SetAnimTimer(hwnd);
     RenderTip(hwnd);
+}
 
-    ApplyDisplayMode(hwnd, g_displayMode);
-
-    ResetBlackHoleAlertState();
+static void StopCardAlert(HWND hwnd)
+{
+    if (!g_alertActive) return;
+    StopShake(hwnd);
+    g_restoringAlert = true;
+    g_alertActive = false;
+    g_alertTaskKey.clear();
+    g_bannerButtons.clear();
+    ApplyDisplayMode(hwnd, g_displayMode);   // 恢复原来的层级（附着桌面 / 始终置顶），并重绘
     g_restoringAlert = false;
-    UpdateHoverHideTimer(hwnd);   // ApplyDisplayMode 时仍处于恢复阶段，这里补上悬停检测
+    UpdateHoverHideTimer(hwnd);
     confWrite();
+    SetAnimTimer(hwnd);
+}
+
+// 每秒检查任务倒计时是否到点
+static void CheckTaskTimers(HWND hwnd)
+{
+    if (!g_taskTimersLoaded) LoadTaskTimers();
+    std::vector<std::wstring> lines;
+    bool fileOk = ReadTodoFileLinesW(lines);
+    std::unordered_map<std::wstring, bool> openTasks;   // key -> 是否未完成
+    for (const auto& l : lines) {
+        bool done = false;
+        if (!IsTodoLine(l)) continue;
+        std::wstring k = TodoKeyOfLine(l, &done);
+        if (!done) openTasks[k] = true;
+        else if (!openTasks.count(k)) openTasks[k] = false;
+    }
+
+    bool changed = false;
+    std::vector<TaskTimer> due;
+    for (auto& t : g_taskTimers) {
+        if (!t.countdown || t.fired || t.start == 0) continue;
+        if (TimerElapsed(t) < t.duration) continue;
+        t.fired = true;
+        changed = true;
+        auto it = openTasks.find(t.key);
+        if (fileOk && (it == openTasks.end() || !it->second)) continue;   // 任务已完成或已删除：静默
+        due.push_back(t);
+    }
+    if (changed) SaveTaskTimers();
+    for (const auto& t : due) {
+        StartCardAlert(hwnd, L"时间到 · " + FormatShortDuration(t.duration), ProcessPlaceholdersW(t.key), t.key);
+    }
+}
+
+static std::vector<std::pair<int, std::wstring>> BannerButtonSpec()
+{
+    std::vector<std::pair<int, std::wstring>> v;
+    bool task = !g_alertTaskKey.empty();
+    if (task) v.push_back({ BANNER_DONE, L"完成" });
+    if (task || !g_reminderArmed) v.push_back({ BANNER_SNOOZE, L"+5 分钟" });
+    v.push_back({ BANNER_DISMISS, L"知道了" });
+    return v;
+}
+
+static void HandleBannerAction(HWND hwnd, int action)
+{
+    std::wstring key = g_alertTaskKey;
+    if (action == BANNER_DONE && !key.empty()) {
+        StopCardAlert(hwnd);
+        for (const auto& h : g_todoHitRects) {
+            if (h.key == key && !h.completed) {
+                TodoHitRect copy = h;
+                BeginToggle(hwnd, copy);   // 播放完成动画
+                return;
+            }
+        }
+        if (ToggleTodoByKey(-1, key)) RenderTip(hwnd);
+        return;
+    }
+    if (action == BANNER_SNOOZE) {
+        if (!key.empty()) {
+            SnoozeTaskTimer(key, 5 * 60);
+        } else if (!g_reminderArmed) {
+            g_reminderArmed = true;
+            g_reminderDue = system_clock::now() + minutes(5);
+            g_reminderTitle = L"倒计时结束";
+            g_reminderDetail = L"稍后提醒（5 分钟）已到";
+            g_reminderIsCountdown = false;
+            g_reminderIntervalSeconds = 0;
+        }
+    }
+    StopCardAlert(hwnd);
+}
+
+// ============================================================================
+//  完成动画 / 行滑动
+// ============================================================================
+static void SetAnimTimer(HWND hwnd)
+{
+    bool fast = g_completeAnim.active || g_settling || g_shaking;
+    bool on = fast || g_alertActive;
+    if (!on) {
+        if (g_animTimerOn) { KillTimer(hwnd, TIMER_ANIM); g_animTimerOn = false; }
+        return;
+    }
+    UINT iv = fast ? 15 : 50;   // 动画 ~60fps；提醒横幅呼吸光 ~20fps
+    if (!g_animTimerOn || iv != g_animTimerInterval) {
+        SetTimer(hwnd, TIMER_ANIM, iv, nullptr);
+        g_animTimerOn = true;
+        g_animTimerInterval = iv;
+    }
+}
+
+static void SnapshotRowsForSettle()
+{
+    g_settleFrom = g_lastRowY;
+    g_settling = true;
+    g_settleStart = steady_clock::now();
+}
+
+static void CommitCompletion(HWND hwnd)
+{
+    if (!g_completeAnim.active) return;
+    CompleteAnim a = g_completeAnim;
+    g_completeAnim.active = false;
+    SnapshotRowsForSettle();
+    if (ToggleTodoByKey(a.sourceIndex, a.key)) {
+        g_justCompletedKey = a.key;
+        if (TaskTimer* t = FindTaskTimer(a.key)) {   // 完成即停表，保留最终用时
+            PauseTaskTimer(*t);
+            t->fired = true;
+            SaveTaskTimers();
+        }
+        if (g_alertActive && g_alertTaskKey == a.key) StopCardAlert(hwnd);
+    } else {
+        g_settling = false;
+        g_settleFrom.clear();
+    }
+    SetAnimTimer(hwnd);
+}
+
+static void BeginToggle(HWND hwnd, const TodoHitRect& hit)
+{
+    if (g_completeAnim.active) CommitCompletion(hwnd);   // 上一个动画未结束：直接落定
+    if (!hit.completed) {
+        g_completeAnim.active = true;
+        g_completeAnim.sourceIndex = hit.sourceIndex;
+        g_completeAnim.key = hit.key;
+        g_completeAnim.start = steady_clock::now();
+    } else {
+        SnapshotRowsForSettle();
+        g_justCompletedKey.clear();
+        if (!ToggleTodoByKey(hit.sourceIndex, hit.key)) {
+            g_settling = false;
+            g_settleFrom.clear();
+        }
+    }
+    SetAnimTimer(hwnd);
+    RenderTip(hwnd);
+}
+
+static void TickAnimations(HWND hwnd)
+{
+    auto now = steady_clock::now();
+    if (g_completeAnim.active && duration<double>(now - g_completeAnim.start).count() >= COMPLETE_ANIM_SEC) {
+        CommitCompletion(hwnd);
+    }
+    if (g_settling && duration<double>(now - g_settleStart).count() >= SETTLE_ANIM_SEC) {
+        g_settling = false;
+        g_settleFrom.clear();
+        g_justCompletedKey.clear();
+    }
+    if (g_alertActive && !g_shaking && g_shakeTimes < SHAKE_MAX_TIMES &&
+        duration<double>(now - g_shakeStart).count() >= SHAKE_REPEAT_SEC) {
+        StartShake(hwnd);
+    }
+    TickShake(hwnd);
+    RenderTip(hwnd);
+    SetAnimTimer(hwnd);
+}
+
+static std::wstring Ellipsize(const std::wstring& s, size_t maxChars)
+{
+    if (s.size() <= maxChars) return s;
+    return s.substr(0, maxChars) + L"…";
+}
+
+static void PromptTaskCountdown(HWND hwnd, const std::wstring& key)
+{
+    std::wstring value;
+    if (!ShowTextPrompt(hwnd, L"任务倒计时", L"输入分钟数，或 MM:SS / HH:MM:SS", L"25", value)) return;
+    int seconds = 0;
+    if (!TryParseCountdownSeconds(value, seconds)) {
+        MessageBoxW(hwnd, L"请输入有效的倒计时时长。", L"DesktopTip", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    StartTaskCountdown(key, seconds);
+}
+
+static void HandleTaskTimerCommand(HWND hwnd, int id)
+{
+    std::wstring key = g_menuTaskKey;
+    if (key.empty()) return;
+    if (id >= ID_TASK_CD_FIRST && id < ID_TASK_CD_FIRST + kTaskPresetCount) {
+        StartTaskCountdown(key, (long long)kTaskPresetMinutes[id - ID_TASK_CD_FIRST] * 60);
+    } else if (id == ID_TASK_CD_CUSTOM) {
+        PromptTaskCountdown(hwnd, key);
+    } else if (id == ID_TASK_STOPWATCH) {
+        StartTaskStopwatch(key);
+    } else if (id == ID_TASK_PAUSE) {
+        ToggleTaskTimerPause(key);
+    } else if (id == ID_TASK_RESTART) {
+        RestartTaskTimer(key);
+    } else if (id == ID_TASK_REMOVE) {
+        RemoveTaskTimer(key);
+        if (g_alertActive && g_alertTaskKey == key) StopCardAlert(hwnd);
+    }
+    RenderTip(hwnd);
 }
 
 static void ArmCountdown(HWND hwnd, int seconds)
@@ -1217,7 +1460,7 @@ static void CheckReminder(HWND hwnd)
         g_reminderIntervalSeconds = repeatSeconds;
     };
 
-    // 重复倒计时命中时，如果黑洞动画尚未结束，则跳过本次提醒，直接进入下一轮计时。
+    // 重复倒计时命中时，如果上一次提醒还没处理，则跳过本次提醒，直接进入下一轮计时。
     if (g_alertActive) {
         if (repeatCountdown) {
             scheduleNextRepeatCountdown(now);
@@ -1230,7 +1473,7 @@ static void CheckReminder(HWND hwnd)
     std::wstring detail = g_reminderDetail;
 
     g_reminderArmed = false;
-    StartReminderAlert(hwnd, title, detail);
+    StartCardAlert(hwnd, title, detail, L"");
 
     if (repeatCountdown) {
         auto nextDue = previousDue + std::chrono::seconds(repeatSeconds);
@@ -1461,13 +1704,47 @@ void ShowSettingsPanel(HWND owner) {
     SetForegroundWindow(g_hSettings);
 }
 
-void ShowContextMenu(HWND hwnd) {
+void ShowContextMenu(HWND hwnd, bool fromCard = false) {
     POINT pt;
     GetCursorPos(&pt);
     g_lastContextMenuPt = pt;
     g_hasLastContextMenuPt = true;
 
     HMENU hMenu = CreatePopupMenu();
+
+    // 在某条待办上右键：顶部出现「任务计时」子菜单（倒计时 / 正计时 / 暂停 / 重新开始 / 移除）
+    g_menuTaskKey.clear();
+    if (fromCard) {
+        POINT cp = pt;
+        ScreenToClient(hwnd, &cp);
+        for (const auto& row : g_rowHitRects) {
+            if (!PtInRect(&row.rc, cp)) continue;
+            g_menuTaskKey = row.key;
+            HMENU hTask = CreatePopupMenu();
+            HMENU hCd = CreatePopupMenu();
+            for (int i = 0; i < kTaskPresetCount; ++i) {
+                wchar_t buf[48];
+                if (kTaskPresetMinutes[i] == 25) swprintf(buf, 48, L"25 分钟（番茄钟）");
+                else if (kTaskPresetMinutes[i] % 60 == 0) swprintf(buf, 48, L"%d 小时", kTaskPresetMinutes[i] / 60);
+                else swprintf(buf, 48, L"%d 分钟", kTaskPresetMinutes[i]);
+                AppendMenuW(hCd, MF_STRING, ID_TASK_CD_FIRST + i, buf);
+            }
+            AppendMenuW(hCd, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(hCd, MF_STRING, ID_TASK_CD_CUSTOM, L"自定义…  Custom");
+            AppendMenuW(hTask, MF_POPUP, (UINT_PTR)hCd, L"倒计时  Countdown");
+            AppendMenuW(hTask, MF_STRING, ID_TASK_STOPWATCH, L"正计时  Stopwatch");
+            if (TaskTimer* t = FindTaskTimer(row.key)) {
+                AppendMenuW(hTask, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(hTask, MF_STRING, ID_TASK_PAUSE, t->start > 0 ? L"暂停  Pause" : L"继续  Resume");
+                AppendMenuW(hTask, MF_STRING, ID_TASK_RESTART, L"重新开始  Restart");
+                AppendMenuW(hTask, MF_STRING, ID_TASK_REMOVE, L"移除计时  Remove timer");
+            }
+            std::wstring title = L"任务计时：" + Ellipsize(ProcessPlaceholdersW(row.key), 16) + L"  Timer";
+            AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hTask, title.c_str());
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+            break;
+        }
+    }
     // 主入口：打开滑动条设置面板（粗体默认项）
     AppendMenuW(hMenu, MF_STRING, ID_SETTINGS,     L"设置…  Settings");
     std::wstring fontLabel = L"字体：" + (g_fontFamily.empty() ? std::wstring(L"默认") : g_fontFamily) + L"…  Font";
@@ -1708,966 +1985,74 @@ static void RoundRectPath(Gdiplus::GraphicsPath& p,
 }
 
 
-// ============================================================================
-//  Blackhole alert renderer
-//  CPU/GDI+ port of the ghostty-blackhole shader structure:
-//  - captured desktop as iChannel0 equivalent
-//  - Schwarzschild-style shadow / analytic lensing displacement
-//  - procedural accretion disk, photon ring, starfield, Lissajous drift
-// ============================================================================
-struct BhVec2 { double x, y; };
-struct BhVec3 { double x, y, z; };
-struct BhColor { double r, g, b; };
-
-static const double BH_PI = 3.1415926535897932384626433832795;
-static const double BH_B_CRIT = 2.5980762;
-
-static double BhClamp(double v, double lo, double hi)
-{
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
-static double BhMin(double a, double b)
-{
-    return a < b ? a : b;
-}
-
-static double BhMax(double a, double b)
-{
-    return a > b ? a : b;
-}
-
-static double BhMix(double a, double b, double t)
-{
-    return a + (b - a) * t;
-}
-
-static double BhSmoothstep(double edge0, double edge1, double x)
-{
-    if (edge0 == edge1) return x < edge0 ? 0.0 : 1.0;
-    double t = BhClamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
-    return t * t * (3.0 - 2.0 * t);
-}
-
-static double BhSmootherstep01(double t)
-{
-    t = BhClamp(t, 0.0, 1.0);
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-}
-
-static double BhFract(double x)
-{
-    return x - std::floor(x);
-}
-
-static double BhMod(double x, double y)
-{
-    return x - y * std::floor(x / y);
-}
-
-static BhVec2 BhAdd(BhVec2 a, BhVec2 b) { return { a.x + b.x, a.y + b.y }; }
-static BhVec2 BhSub(BhVec2 a, BhVec2 b) { return { a.x - b.x, a.y - b.y }; }
-static BhVec2 BhMul(BhVec2 a, double s) { return { a.x * s, a.y * s }; }
-static BhVec3 BhAdd3(BhVec3 a, BhVec3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static BhVec3 BhMul3(BhVec3 a, double s) { return { a.x * s, a.y * s, a.z * s }; }
-static BhColor BhColorAdd(BhColor a, BhColor b) { return { a.r + b.r, a.g + b.g, a.b + b.b }; }
-static BhColor BhColorMul(BhColor a, double s) { return { a.r * s, a.g * s, a.b * s }; }
-static BhColor BhColorMix(BhColor a, BhColor b, double t)
-{
-    return { BhMix(a.r, b.r, t), BhMix(a.g, b.g, t), BhMix(a.b, b.b, t) };
-}
-
-static double BhDot(BhVec2 a, BhVec2 b) { return a.x * b.x + a.y * b.y; }
-static double BhDot3(BhVec3 a, BhVec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static double BhLen(BhVec2 v) { return std::sqrt(BhDot(v, v)); }
-static double BhLen3(BhVec3 v) { return std::sqrt(BhDot3(v, v)); }
-
-static BhVec2 BhNormalize(BhVec2 v)
-{
-    double l = BhLen(v);
-    if (l < 1e-9) return { 0.0, 0.0 };
-    return { v.x / l, v.y / l };
-}
-
-static BhVec3 BhNormalize3(BhVec3 v)
-{
-    double l = BhLen3(v);
-    if (l < 1e-9) return { 0.0, 0.0, -1.0 };
-    return { v.x / l, v.y / l, v.z / l };
-}
-
-static BhVec2 BhRot(BhVec2 v, double a)
-{
-    double c = std::cos(a), s = std::sin(a);
-    return { c * v.x - s * v.y, s * v.x + c * v.y };
-}
-
-static double BhHash21(BhVec2 p)
-{
-    p.x = BhFract(p.x * 234.34);
-    p.y = BhFract(p.y * 435.345);
-    double d = p.x * (p.x + 34.23) + p.y * (p.y + 34.23);
-    p.x += d;
-    p.y += d;
-    return BhFract(p.x * p.y);
-}
-
-static double BhVNoiseWrapY(BhVec2 p, double perY)
-{
-    BhVec2 i = { std::floor(p.x), std::floor(p.y) };
-    BhVec2 f = { BhFract(p.x), BhFract(p.y) };
-    f.x = f.x * f.x * (3.0 - 2.0 * f.x);
-    f.y = f.y * f.y * (3.0 - 2.0 * f.y);
-    double y0 = BhMod(i.y, perY);
-    double y1 = BhMod(i.y + 1.0, perY);
-    double a = BhMix(BhHash21({ i.x, y0 }), BhHash21({ i.x + 1.0, y0 }), f.x);
-    double b = BhMix(BhHash21({ i.x, y1 }), BhHash21({ i.x + 1.0, y1 }), f.x);
-    return BhMix(a, b, f.y);
-}
-
-static BhVec2 BhLissa(double t)
-{
-    return {
-        0.75 * std::sin(t * 0.37) + 0.25 * std::sin(t * 0.83 + 1.0),
-        0.70 * std::sin(t * 0.54 + 2.1) + 0.30 * std::sin(t * 1.07)
-    };
-}
-
-static BhColor BhBlackbody(double T)
-{
-    double t = BhClamp(T, 1500.0, 40000.0) / 100.0;
-    double r = t <= 66.0 ? 1.0 : BhClamp(1.292936 * std::pow(t - 60.0, -0.1332047), 0.0, 1.0);
-    double g = t <= 66.0 ? BhClamp(0.3900816 * std::log(t) - 0.6318414, 0.0, 1.0)
-                         : BhClamp(1.1298909 * std::pow(t - 60.0, -0.0755148), 0.0, 1.0);
-    double b = t >= 66.0 ? 1.0 : (t <= 19.0 ? 0.0 : BhClamp(0.5432068 * std::log(t - 10.0) - 1.1962540, 0.0, 1.0));
-    return { r, g, b };
-}
-
-static BhColor BhStars(BhVec3 d, double time)
-{
-    double ax = std::atan2(d.x, -d.z);
-    double ay = std::asin(BhClamp(d.y, -1.0, 1.0));
-    BhVec2 g = { ax * 40.0, ay * 40.0 };
-    BhVec2 id = { std::floor(g.x), std::floor(g.y) };
-    double h = BhHash21(id);
-    if (h < 0.92) return { 0.0, 0.0, 0.0 };
-    BhVec2 f = { BhFract(g.x) - 0.5, BhFract(g.y) - 0.5 };
-    BhVec2 off = { (BhHash21({ id.x + 17.3, id.y + 17.3 }) - 0.5) * 0.7,
-                   (BhHash21({ id.x + 31.7, id.y + 31.7 }) - 0.5) * 0.7 };
-    double spark = BhSmoothstep(0.10, 0.0, BhLen(BhSub(f, off)));
-    double tw = 0.7 + 0.3 * std::sin(time * (0.5 + 2.0 * BhHash21({ id.x + 5.1, id.y + 5.1 })) + 40.0 * h);
-    double tintK = BhHash21({ id.x + 2.9, id.y + 2.9 });
-    BhColor warm = { 1.0, 0.82, 0.60 };
-    BhColor cool = { 0.75, 0.85, 1.0 };
-    return BhColorMul(BhColorMix(warm, cool, tintK), spark * tw * ((h - 0.92) / 0.08));
-}
-
-static double BhMirror01(double u)
-{
-    return 1.0 - std::fabs(1.0 - BhMod(u, 2.0));
-}
-
-static BhColor BhSampleBackground(double u, double v)
-{
-    if (!g_blackholeBgReady || g_blackholeBg.empty() || g_blackholeW <= 0 || g_blackholeH <= 0) {
-        return { 0.0, 0.0, 0.0 };
-    }
-    u = BhMirror01(u);
-    v = BhMirror01(v);
-    double sx = BhClamp(u * (g_blackholeW - 1), 0.0, (double)(g_blackholeW - 1));
-    double sy = BhClamp(v * (g_blackholeH - 1), 0.0, (double)(g_blackholeH - 1));
-    int x0 = (int)std::floor(sx);
-    int y0 = (int)std::floor(sy);
-    int x1 = (x0 + 1 < g_blackholeW) ? x0 + 1 : x0;
-    int y1 = (y0 + 1 < g_blackholeH) ? y0 + 1 : y0;
-    double fx = sx - x0;
-    double fy = sy - y0;
-
-    auto sample = [&](int x, int y) -> BhColor {
-        const BYTE* px = &g_blackholeBg[((size_t)y * (size_t)g_blackholeW + (size_t)x) * 4];
-        return { px[2] / 255.0, px[1] / 255.0, px[0] / 255.0 };
-    };
-
-    BhColor c00 = sample(x0, y0);
-    BhColor c10 = sample(x1, y0);
-    BhColor c01 = sample(x0, y1);
-    BhColor c11 = sample(x1, y1);
-    BhColor cx0 = BhColorMix(c00, c10, fx);
-    BhColor cx1 = BhColorMix(c01, c11, fx);
-    return BhColorMix(cx0, cx1, fy);
-}
-
-static int BhByte(double v)
-{
-    return (int)BhClamp(v * 255.0 + 0.5, 0.0, 255.0);
-}
-
-static double BlackHoleEffectRadius(double rh)
-{
-    const double rin = 1.8;
-    const double rout = 8.0;
-    return BhMin(0.54, BhMax(4.18 * rh, (rout / BH_B_CRIT) * rh * 1.14));
-}
-
-static double BlackHoleCurrentRh(const BlackHoleInstance& hole, double elapsed)
-{
-    double wave = 0.5 + 0.5 * std::sin((elapsed / BhMax(hole.period, 0.25)) * 2.0 * BH_PI + hole.phase);
-    double eased = BhSmootherstep01(wave);
-    return BhMix(hole.minRh, hole.maxRh, eased);
-}
-
-static double BhBounceCoord(double value, double velocity, double elapsed, double lo, double hi)
-{
-    if (hi <= lo) return (lo + hi) * 0.5;
-    double span = hi - lo;
-    double local = (value - lo) + velocity * elapsed;
-    return lo + BhMirror01(local / span) * span;
-}
-
-static BhVec2 BlackHoleCurrentCenter(const BlackHoleInstance& hole, double elapsed, double aspect)
-{
-    double marginY = BhClamp(hole.maxEffectR + 0.018, 0.060, 0.46);
-    double marginX = BhClamp(hole.maxEffectR / BhMax(aspect, 0.1) + 0.018, 0.060, 0.46);
-    return {
-        BhBounceCoord(hole.cx, hole.moveVx, elapsed, marginX, 1.0 - marginX),
-        BhBounceCoord(hole.cy, hole.moveVy, elapsed, marginY, 1.0 - marginY)
-    };
-}
-
-static BlackHoleInstance MakeBlackHoleInstance(double cx, double cy, double maxRh, int count = 3)
-{
-    BlackHoleInstance hole;
-    hole.cx = cx;
-    hole.cy = cy;
-    {
-        double angle = RandDouble(0.0, 2.0 * BH_PI);
-        for (int i = 0; i < 8; ++i) {
-            if (std::fabs(std::cos(angle)) >= 0.30 && std::fabs(std::sin(angle)) >= 0.30) break;
-            angle = RandDouble(0.0, 2.0 * BH_PI);
-        }
-        double speed = BhClamp(0.0072 / BhMax(maxRh, 0.01), 0.075, 0.22);
-        hole.moveVx = std::cos(angle) * speed;
-        hole.moveVy = std::sin(angle) * speed;
-    }
-    if (count <= 2) {
-        hole.moveAmpX = RandDouble(0.095, 0.160);
-        hole.moveAmpY = RandDouble(0.075, 0.130);
-    } else if (count == 3) {
-        hole.moveAmpX = RandDouble(0.075, 0.125);
-        hole.moveAmpY = RandDouble(0.060, 0.105);
-    } else if (count == 4) {
-        hole.moveAmpX = RandDouble(0.055, 0.095);
-        hole.moveAmpY = RandDouble(0.045, 0.080);
-    } else {
-        hole.moveAmpX = RandDouble(0.040, 0.072);
-        hole.moveAmpY = RandDouble(0.035, 0.065);
-    }
-    hole.movePeriodX = RandDouble(10.0, 18.0);
-    hole.movePeriodY = RandDouble(12.0, 22.0);
-    hole.movePhaseX = RandDouble(0.0, 2.0 * BH_PI);
-    hole.movePhaseY = RandDouble(0.0, 2.0 * BH_PI);
-    hole.maxRh = maxRh;
-    hole.minRh = maxRh * RandDouble(0.38, 0.56);
-    hole.maxEffectR = BlackHoleEffectRadius(hole.maxRh);
-    hole.period = RandDouble(12.0, 26.0);
-    hole.phase = RandDouble(0.0, 2.0 * BH_PI);
-    hole.roll = RandDouble(-0.85, 0.85);
-    hole.incl = RandDouble(1.16, 1.68);
-    hole.diskSpeed = RandDouble(3.4, 6.8);
-    hole.seed = RandDouble(0.0, 1000.0);
-    return hole;
-}
-
-static bool BlackHoleOverlapsAny(const BlackHoleInstance& candidate,
-    const std::vector<BlackHoleInstance>& holes, double aspect)
-{
-    auto visibleR = [](const BlackHoleInstance& hole) {
-        return hole.maxRh * 1.85;
-    };
-
-    for (const auto& other : holes) {
-        double dx = (candidate.cx - other.cx) * aspect;
-        double dy = candidate.cy - other.cy;
-        double d = std::sqrt(dx * dx + dy * dy);
-        double moveX = (candidate.moveAmpX + other.moveAmpX) * aspect;
-        double moveY = candidate.moveAmpY + other.moveAmpY;
-        double movePad = std::sqrt(moveX * moveX + moveY * moveY);
-        double minD = visibleR(candidate) + visibleR(other) + movePad * 0.35 + 0.025;
-        if (d < minD) return true;
-    }
-    return false;
-}
-
-static double BlackHoleSizeCapForCount(int count)
-{
-    if (count <= 2) return 0.064;
-    return 0.054;
-}
-
-static void InitBlackHoleInstancesGrid(int count, double aspect)
-{
-    std::vector<BhVec2> cells = {
-        { 0.20, 0.25 }, { 0.50, 0.23 }, { 0.80, 0.26 },
-        { 0.25, 0.72 }, { 0.57, 0.74 }, { 0.84, 0.70 }
-    };
-    std::shuffle(cells.begin(), cells.end(), g_rng);
-
-    g_blackHoles.clear();
-    double cap = BlackHoleSizeCapForCount(count);
-    for (int i = 0; i < count && i < (int)cells.size(); ++i) {
-        double maxRh = RandDouble(cap * 0.72, cap);
-        BlackHoleInstance hole = MakeBlackHoleInstance(cells[(size_t)i].x, cells[(size_t)i].y, maxRh, count);
-        double marginY = BhClamp(hole.maxEffectR + 0.018, 0.060, 0.46);
-        double marginX = BhClamp(hole.maxEffectR / BhMax(aspect, 0.1) + 0.018, 0.060, 0.46);
-        hole.cx = BhClamp(hole.cx + RandDouble(-0.045, 0.045), marginX, 1.0 - marginX);
-        hole.cy = BhClamp(hole.cy + RandDouble(-0.040, 0.040), marginY, 1.0 - marginY);
-        g_blackHoles.push_back(hole);
-    }
-}
-
-static void InitBlackHoleInstances(int W, int H)
-{
-    g_blackHoles.clear();
-    if (W <= 0 || H <= 0) return;
-
-    int count = 1;
-    double aspect = (double)W / (double)H;
-    std::vector<BlackHoleInstance> holes;
-    holes.reserve((size_t)count);
-
-    double cap = BlackHoleSizeCapForCount(count);
-    for (int i = 0; i < count; ++i) {
-        bool placed = false;
-        for (int attempt = 0; attempt < 220; ++attempt) {
-            double shrink = attempt < 140 ? 1.0 : BhMix(0.96, 0.70, (attempt - 140) / 80.0);
-            double maxRh = RandDouble(cap * 0.64 * shrink, cap * shrink);
-            BlackHoleInstance hole = MakeBlackHoleInstance(0.5, 0.5, maxRh, count);
-            double marginY = BhClamp(hole.maxEffectR + 0.018, 0.060, 0.46);
-            double marginX = BhClamp(hole.maxEffectR / BhMax(aspect, 0.1) + 0.018, 0.060, 0.46);
-            if (marginX >= 0.49 || marginY >= 0.49) continue;
-
-            hole.cx = RandDouble(marginX, 1.0 - marginX);
-            hole.cy = RandDouble(marginY, 1.0 - marginY);
-            if (!BlackHoleOverlapsAny(hole, holes, aspect)) {
-                holes.push_back(hole);
-                placed = true;
-                break;
-            }
-        }
-
-        if (!placed) {
-            InitBlackHoleInstancesGrid(count, aspect);
-            return;
-        }
-    }
-
-    g_blackHoles = holes;
-}
-
-static RECT BlackHoleDirtyRect(BhVec2 center, double rh, int W, int H, double aspect)
-{
-    double effectR = BlackHoleEffectRadius(rh);
-    int x0 = (int)BhClamp(std::floor((center.x - effectR / aspect) * W) - 8.0, 0.0, (double)(W - 1));
-    int x1 = (int)BhClamp(std::ceil ((center.x + effectR / aspect) * W) + 8.0, 0.0, (double)(W - 1));
-    int y0 = (int)BhClamp(std::floor((center.y - effectR) * H) - 8.0, 0.0, (double)(H - 1));
-    int y1 = (int)BhClamp(std::ceil ((center.y + effectR) * H) + 8.0, 0.0, (double)(H - 1));
-    RECT r = { x0, y0, x1 + 1, y1 + 1 };
-    return r;
-}
-
-static void CaptureBlackHoleBackground(HWND hwnd)
-{
-    g_blackholeBgReady = false;
-    g_blackholeBg.clear();
-    g_blackholeVX = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    g_blackholeVY = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    g_blackholeW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    g_blackholeH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (g_blackholeW <= 0 || g_blackholeH <= 0) return;
-
-    BOOL wasVisible = IsWindowVisible(hwnd);
-    if (wasVisible) {
-        g_reparenting = true;
-        ShowWindow(hwnd, SW_HIDE);
-        g_reparenting = false;
-        // Wait for DWM to commit the hidden state. Without this, BitBlt can capture
-        // stale border/title pixels from the previous composition frame.
-        DwmFlush();
-        Sleep(16);
-    }
-
-    HDC screen = GetDC(NULL);
-    HDC memDC = screen ? CreateCompatibleDC(screen) : NULL;
-    HBITMAP hbm = NULL;
-    HBITMAP oldbm = NULL;
-    void* bits = nullptr;
-
-    if (screen && memDC) {
-        BITMAPINFO bmi; ZeroMemory(&bmi, sizeof(bmi));
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = g_blackholeW;
-        bmi.bmiHeader.biHeight = -g_blackholeH;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        hbm = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-        if (hbm && bits) {
-            oldbm = (HBITMAP)SelectObject(memDC, hbm);
-            BitBlt(memDC, 0, 0, g_blackholeW, g_blackholeH, screen, g_blackholeVX, g_blackholeVY, SRCCOPY | CAPTUREBLT);
-            size_t bytes = (size_t)g_blackholeW * (size_t)g_blackholeH * 4;
-            g_blackholeBg.resize(bytes);
-            memcpy(g_blackholeBg.data(), bits, bytes);
-            // BitBlt into a 32-bit DIB often leaves alpha undefined/zero. Force it to
-            // opaque so the cached desktop can become the full-screen layered frame.
-            for (size_t i = 3; i < bytes; i += 4) {
-                g_blackholeBg[i] = 255;
-            }
-            g_blackholeBgReady = true;
-            ++g_blackholeBgSerial;
-        }
-    }
-
-    if (oldbm) SelectObject(memDC, oldbm);
-    if (hbm) DeleteObject(hbm);
-    if (memDC) DeleteDC(memDC);
-    if (screen) ReleaseDC(NULL, screen);
-
-    if (wasVisible) {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-}
-
-
-static bool BhRectEmptyPx(const RECT& r)
-{
-    return r.right <= r.left || r.bottom <= r.top;
-}
-
-static RECT BhClampRectPx(RECT r, int W, int H)
-{
-    if (r.left < 0) r.left = 0;
-    if (r.top < 0) r.top = 0;
-    if (r.right > W) r.right = W;
-    if (r.bottom > H) r.bottom = H;
-    if (r.right < r.left) r.right = r.left;
-    if (r.bottom < r.top) r.bottom = r.top;
-    return r;
-}
-
-static RECT BhUnionRectPx(RECT a, RECT b)
-{
-    if (BhRectEmptyPx(a)) return b;
-    if (BhRectEmptyPx(b)) return a;
-    RECT r;
-    r.left = min(a.left, b.left);
-    r.top = min(a.top, b.top);
-    r.right = max(a.right, b.right);
-    r.bottom = max(a.bottom, b.bottom);
-    return r;
-}
-
-static RECT BhInflateRectPx(RECT r, int pad, int W, int H)
-{
-    r.left -= pad;
-    r.top -= pad;
-    r.right += pad;
-    r.bottom += pad;
-    return BhClampRectPx(r, W, H);
-}
-
-static void ReleaseBlackHoleRenderBuffer()
-{
-    if (g_blackholeRenderDC && g_blackholeRenderOldBitmap) {
-        SelectObject(g_blackholeRenderDC, g_blackholeRenderOldBitmap);
-    }
-    if (g_blackholeRenderBitmap) {
-        DeleteObject(g_blackholeRenderBitmap);
-    }
-    if (g_blackholeRenderDC) {
-        DeleteDC(g_blackholeRenderDC);
-    }
-    g_blackholeRenderDC = NULL;
-    g_blackholeRenderBitmap = NULL;
-    g_blackholeRenderOldBitmap = NULL;
-    g_blackholeRenderBits = nullptr;
-    g_blackholeRenderW = 0;
-    g_blackholeRenderH = 0;
-    g_blackholeRenderVX = 0;
-    g_blackholeRenderVY = 0;
-    g_blackholeFrameInitialized = false;
-    g_blackholeFrameBgSerial = 0;
-    g_blackholePrevDirty = { 0, 0, 0, 0 };
-    g_blackholePrevDirtyValid = false;
-}
-
-static bool EnsureBlackHoleRenderBuffer(HDC screen, int W, int H, int vx, int vy)
-{
-    if (g_blackholeRenderDC && g_blackholeRenderBitmap && g_blackholeRenderBits &&
-        g_blackholeRenderW == W && g_blackholeRenderH == H &&
-        g_blackholeRenderVX == vx && g_blackholeRenderVY == vy) {
-        return true;
-    }
-
-    ReleaseBlackHoleRenderBuffer();
-
-    BITMAPINFO bmi; ZeroMemory(&bmi, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = W;
-    bmi.bmiHeader.biHeight = -H; // top-down DIB; matches g_blackholeBg indexing
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    g_blackholeRenderDC = CreateCompatibleDC(screen);
-    if (!g_blackholeRenderDC) {
-        ReleaseBlackHoleRenderBuffer();
-        return false;
-    }
-
-    g_blackholeRenderBitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS,
-        &g_blackholeRenderBits, NULL, 0);
-    if (!g_blackholeRenderBitmap || !g_blackholeRenderBits) {
-        ReleaseBlackHoleRenderBuffer();
-        return false;
-    }
-
-    g_blackholeRenderOldBitmap = (HBITMAP)SelectObject(g_blackholeRenderDC, g_blackholeRenderBitmap);
-    g_blackholeRenderW = W;
-    g_blackholeRenderH = H;
-    g_blackholeRenderVX = vx;
-    g_blackholeRenderVY = vy;
-    g_blackholeFrameInitialized = false;
-    g_blackholeFrameBgSerial = 0;
-    g_blackholePrevDirtyValid = false;
-    return true;
-}
-
-static void RestoreBlackHoleFrameRect(const RECT& rect, int W, int H)
-{
-    if (!g_blackholeRenderBits || W <= 0 || H <= 0) return;
-    RECT r = BhClampRectPx(rect, W, H);
-    if (BhRectEmptyPx(r)) return;
-
-    BYTE* dstBase = (BYTE*)g_blackholeRenderBits;
-    const int stride = W * 4;
-    const size_t rowBytes = (size_t)(r.right - r.left) * 4;
-
-    // Clear the dirty area to transparent. The renderer writes an aligned captured
-    // base color only inside each feathered field, so the boundary can blend back
-    // to the real desktop below without leaving a stale frame.
-    for (int y = r.top; y < r.bottom; ++y) {
-        BYTE* dst = dstBase + (size_t)y * stride + (size_t)r.left * 4;
-        memset(dst, 0, rowBytes);
-    }
-}
-
-static void ResetBlackHoleAlertState()
-{
-    ReleaseBlackHoleRenderBuffer();
-    g_blackholeBg.clear();
-    g_blackholeBgReady = false;
-    g_blackholeW = 0;
-    g_blackholeH = 0;
-    g_blackholeVX = 0;
-    g_blackholeVY = 0;
-    g_blackHoles.clear();
-    ++g_blackholeBgSerial;
-}
-
-static void EnsureBlackHoleWindowBounds(HWND hwnd)
-{
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (vw <= 0 || vh <= 0) return;
-    SetWindowPos(hwnd, HWND_TOPMOST, vx, vy, vw, vh,
-        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-}
-
-static void RenderBlackHoleAlert(HWND hwnd)
-{
-    using namespace Gdiplus;
-
-    int W = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int H = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    if (W <= 0 || H <= 0) return;
-
-    RECT wr{};
-    if (!GetWindowRect(hwnd, &wr) || wr.left != vx || wr.top != vy ||
-        (wr.right - wr.left) != W || (wr.bottom - wr.top) != H) {
-        SetWindowPos(hwnd, HWND_TOPMOST, vx, vy, W, H,
-            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-    }
-
-    if (!g_blackholeBgReady || g_blackholeW != W || g_blackholeH != H ||
-        g_blackholeVX != vx || g_blackholeVY != vy) {
-        CaptureBlackHoleBackground(hwnd);
-    }
-
-    HDC screen = GetDC(NULL);
-    if (!screen) return;
-    if (!EnsureBlackHoleRenderBuffer(screen, W, H, vx, vy)) {
-        ReleaseDC(NULL, screen);
-        return;
-    }
-
-    BhVec2 alertCenter = { 0.5, 0.5 };
-    double alertRh = 0.012;
-    const int stride = W * 4;
-    BYTE* frameBits = (BYTE*)g_blackholeRenderBits;
-
-    {
-        double elapsed = duration<double>(steady_clock::now() - g_alertStarted).count();
-        double aspect = (double)W / (double)H;
-        double t = elapsed;
-        if (g_blackHoles.empty()) {
-            InitBlackHoleInstances(W, H);
-        }
-        if (g_blackHoles.empty()) {
-            g_blackHoles.push_back(MakeBlackHoleInstance(0.5, 0.5, 0.060, 1));
-        }
-
-        struct HoleFrame {
-            const BlackHoleInstance* hole;
-            BhVec2 center;
-            double rh;
-            double effectR;
-            RECT dirty;
-        };
-
-        std::vector<HoleFrame> frames;
-        frames.reserve(g_blackHoles.size());
-        RECT currentDirty = { 0, 0, 0, 0 };
-        double textScore = -1.0;
-        for (const auto& hole : g_blackHoles) {
-            BhVec2 center = BlackHoleCurrentCenter(hole, elapsed, aspect);
-            double rh = BlackHoleCurrentRh(hole, elapsed);
-            double effectR = BlackHoleEffectRadius(rh);
-            RECT dirty = BlackHoleDirtyRect(center, rh, W, H, aspect);
-            frames.push_back({ &hole, center, rh, effectR, dirty });
-            currentDirty = BhUnionRectPx(currentDirty, dirty);
-            if (hole.maxRh > textScore) {
-                textScore = hole.maxRh;
-                alertCenter = center;
-                alertRh = rh;
-            }
-        }
-
-        RECT restoreDirty = currentDirty;
-        if (g_blackholePrevDirtyValid) {
-            restoreDirty = BhUnionRectPx(restoreDirty, g_blackholePrevDirty);
-        }
-
-        if (!g_blackholeFrameInitialized || g_blackholeFrameBgSerial != g_blackholeBgSerial) {
-            RECT full = { 0, 0, W, H };
-            RestoreBlackHoleFrameRect(full, W, H);
-            g_blackholeFrameInitialized = true;
-            g_blackholeFrameBgSerial = g_blackholeBgSerial;
-            g_blackholePrevDirtyValid = false;
-        } else {
-            RestoreBlackHoleFrameRect(restoreDirty, W, H);
-        }
-
-        const double LENS_DEPTH = 13.0;
-        const double DISK_INNER = 1.8;
-        const double DISK_OUTER = 8.0;
-        const double DISK_GAIN = 2.2;
-        const double DISK_OPACITY = 0.90;
-        const double DISK_TEMP = 5500.0;
-        const double DOPPLER_MIX = 0.60;
-        const double DISK_BEAM = 2.5;
-        const double DISK_WIND = 7.0;
-        const double DISK_CONTRAST = 1.6;
-        const double EXPOSURE = 1.4;
-        const double DILATION_MIN = 0.20;
-        const double STAR_GAIN = 0.08;
-
-        for (const auto& frame : frames) {
-            const BlackHoleInstance& hole = *frame.hole;
-            double rh = frame.rh;
-            double effectR = frame.effectR;
-            BhVec2 center = frame.center;
-            double sizePulse = BhClamp((rh - hole.minRh) / BhMax(hole.maxRh - hole.minRh, 1e-5), 0.0, 1.0);
-            double I = BhMix(0.36, 1.0, sizePulse);
-            double Wscale = BH_B_CRIT / BhMax(rh, 1e-4);
-            double rin = BhMax(DISK_INNER, 1.6);
-            double rout = BhMax(DISK_OUTER, rin + 0.5);
-            double Z0 = BhMax(14.0, rout + 5.0);
-            double dil = BhMix(1.0, DILATION_MIN, I);
-
-            for (int y = frame.dirty.top; y < frame.dirty.bottom; ++y) {
-                BYTE* row = frameBits + (size_t)y * stride;
-                for (int x = frame.dirty.left; x < frame.dirty.right; ++x) {
-                    double uvx = ((double)x + 0.5) / (double)W;
-                    double uvy = ((double)y + 0.5) / (double)H;
-                    BhVec2 p = { (uvx - center.x) * aspect, (uvy - center.y) };
-                    double plen = BhLen(p);
-                    if (plen > effectR) continue;
-
-                    double fieldMaskRaw = 1.0 - BhSmoothstep(effectR * BH_FIELD_FEATHER_START, effectR, plen);
-                    double fieldAlpha = std::pow(BhSmootherstep01(fieldMaskRaw), BH_FIELD_ALPHA_POWER);
-                    if (fieldAlpha <= 0.0008) continue;
-
-                    double edgeAlign = BhSmootherstep01(BhSmoothstep(effectR * 0.76, effectR * 0.985, plen));
-                    double effectMask = BhSmootherstep01(1.0 - BhSmoothstep(effectR * 0.56, effectR * 0.96, plen));
-                    double window = std::exp(-std::pow(plen / BhMax(4.10 * rh, 1e-4), 2.25));
-                    double warpBlend = BhClamp(window * BH_WARP_VIS_GAIN * effectMask, 0.0, 0.94);
-
-                    BhColor base = BhSampleBackground(uvx, uvy);
-                    BhVec2 pr2 = BhRot({ p.x, -p.y }, hole.roll);
-                    pr2 = BhMul(pr2, Wscale);
-                    double b = BhLen(pr2);
-                    BhVec2 dir = BhNormalize(p);
-
-                    double darkMask = 1.0 - BhSmoothstep(effectR * BH_DARK_CORE_END, effectR * BH_DARK_FEATHER_END, plen);
-                    double well = 1.0 - BhSmoothstep(rh * 1.10, effectR * 0.86, plen);
-                    double carrier = darkMask * (1.0 + BH_LOCAL_FIELD_VIGNETTE * well);
-                    BhColor col = {
-                        BH_LOCAL_FIELD_TINT_R * carrier * (1.0 + 0.30 * sizePulse),
-                        BH_LOCAL_FIELD_TINT_G * carrier * (1.0 + 0.30 * sizePulse),
-                        BH_LOCAL_FIELD_TINT_B * carrier * (1.0 + 0.30 * sizePulse)
-                    };
-                    double alpha = BhClamp(fieldAlpha * (0.16 + 0.50 * effectMask), 0.0, 0.82);
-
-                    if (warpBlend > 0.002) {
-                        double u = Z0 / std::sqrt(Z0 * Z0 + b * b);
-                        double defl = (2.0 / (Wscale * Wscale)) / BhMax(plen, 1e-4)
-                            * (1.29 * u + 0.07) * BhMax(LENS_DEPTH - 2.14 * u + 0.75, 0.0) * window;
-
-                        BhColor warped = { 0.0, 0.0, 0.0 };
-                        for (int c = 0; c < 3; ++c) {
-                            double ab = 0.035 * BhSmoothstep(0.9, 2.0, b / (rout + 3.0));
-                            double k = 1.0 + ((double)c - 1.0) * ab;
-                            BhVec2 sp = BhSub(p, BhMul(dir, defl * k));
-                            double su = center.x + sp.x / aspect;
-                            double sv = center.y + sp.y;
-                            BhColor sc = BhSampleBackground(su, sv);
-                            if (c == 0) warped.r = sc.r;
-                            else if (c == 1) warped.g = sc.g;
-                            else warped.b = sc.b;
-                        }
-                        col = BhColorAdd(col, BhColorMul(warped, warpBlend));
-                        alpha = BhMax(alpha, BhClamp(fieldAlpha * warpBlend * BH_DISTORTION_ALPHA_GAIN, 0.0, BH_DISTORTION_MAX_ALPHA));
-                    }
-
-                    if (STAR_GAIN > 0.0 && b > 0.25) {
-                        BhVec3 sd = BhNormalize3({ -(pr2.x / b) * (2.0 / b), -(pr2.y / b) * (2.0 / b), -1.0 });
-                        BhColor st = BhColorMul(BhStars(sd, t + hole.seed), STAR_GAIN * window * fieldAlpha);
-                        col = BhColorAdd(col, st);
-                        alpha = BhMax(alpha, fieldAlpha * BhClamp((st.r + st.g + st.b) * 0.45, 0.0, 0.82));
-                    }
-
-                    BhVec2 diskLocal = BhRot(p, -hole.roll);
-                    double flatten = BhMax(0.18, std::cos(hole.incl) + 0.12);
-                    double dx = diskLocal.x;
-                    double dy = diskLocal.y / flatten;
-                    double rdScreen = std::sqrt(dx * dx + dy * dy);
-                    double rc = rdScreen * Wscale;
-                    if (rc > rin && rc < rout) {
-                        double band = BhSmoothstep(rin, rin * 1.25, rc) * (1.0 - BhSmoothstep(rout * 0.70, rout, rc));
-                        double phi = std::atan2(dy, dx);
-                        double turns = phi / (2.0 * BH_PI);
-                        double kep = std::pow(rin / rc, 1.5);
-                        double gloc = std::sqrt(BhMax(1.0 - 1.5 / rc, 0.02));
-                        double swirl = rc * DISK_WIND * 0.12 - (t + hole.seed) * kep * std::fabs(hole.diskSpeed) * gloc * dil;
-                        double streaks = BhVNoiseWrapY({ rc * 2.8, turns * 19.0 + swirl * 3.0 }, 19.0) * 0.65
-                                        + BhVNoiseWrapY({ rc * 1.0, turns *  9.0 + swirl * 1.5 + 7.0 }, 9.0) * 0.35;
-                        streaks = 0.35 + DISK_CONTRAST * streaks * streaks;
-
-                        double beta = BhClamp(1.0 / std::sqrt(BhMax(2.0 * (rc - 1.0), 0.2)), 0.0, 0.99);
-                        double approach = std::cos(phi - 0.55);
-                        double gg = gloc / BhMax(1.0 - beta * approach * 0.72, 0.05);
-                        gg = BhMix(1.0, gg, DOPPLER_MIX);
-                        double xpr = BhMax(1.0 - std::sqrt(rin / rc), 0.0);
-                        double tprof = std::pow(rin / rc, 0.75) * std::pow(xpr, 0.25) / 0.488;
-                        BhColor cbb = BhBlackbody(DISK_TEMP * tprof * gg);
-                        double boost = std::pow(gg, DISK_BEAM);
-                        double density = band * streaks;
-
-                        double shadowCut = BhSmoothstep(rh * 0.84, rh * 1.06, plen);
-                        double farSideLift = 0.70 + 0.30 * BhSmoothstep(-0.15, 0.45, std::sin(phi));
-                        density *= shadowCut * farSideLift;
-
-                        BhColor emit = BhColorMul(cbb, DISK_GAIN * 2.2 * density * tprof * tprof * boost);
-                        BhColor disk = { 1.0 - std::exp(-emit.r * EXPOSURE),
-                                         1.0 - std::exp(-emit.g * EXPOSURE),
-                                         1.0 - std::exp(-emit.b * EXPOSURE) };
-                        double diskA = BhClamp(DISK_OPACITY * density * 0.62 + (disk.r + disk.g + disk.b) * 0.20, 0.0, 1.0);
-                        col = BhColorAdd(BhColorMul(col, 1.0 - diskA * 0.56), BhColorMul(disk, 1.18));
-                        alpha = BhMax(alpha, fieldAlpha * diskA);
-                    }
-
-                    double ring = std::exp(-std::pow((plen - rh * 1.045) / BhMax(rh * 0.038, 1e-4), 2.0));
-                    if (ring > 0.002) {
-                        BhColor ringCol = { 1.0, 0.78, 0.42 };
-                        col = BhColorAdd(col, BhColorMul(ringCol, ring * (1.38 + 0.55 * I)));
-                        alpha = BhMax(alpha, fieldAlpha * BhClamp(ring * 0.88, 0.0, 1.0));
-                    }
-                    double shadow = 1.0 - BhSmoothstep(rh * 0.92 * BH_EVENT_HORIZON_RADIUS_SCALE,
-                        rh * 1.03 * BH_EVENT_HORIZON_RADIUS_SCALE, plen);
-                    if (shadow > 0.0) {
-                        double shadowVisual = BhClamp(shadow * BH_EVENT_HORIZON_OPACITY, 0.0, 1.0);
-                        col = BhColorMul(col, 1.0 - shadowVisual);
-                        alpha = BhMax(alpha, fieldAlpha * BhClamp(shadowVisual * 0.995, 0.0, 1.0));
-                    }
-
-                    col = BhColorMix(col, base, edgeAlign * 0.72);
-                    alpha = BhMix(alpha, BhClamp(fieldAlpha * 0.10, 0.0, 0.20), edgeAlign);
-
-                    col.r = BhClamp(col.r, 0.0, 1.0);
-                    col.g = BhClamp(col.g, 0.0, 1.0);
-                    col.b = BhClamp(col.b, 0.0, 1.0);
-                    alpha = BhClamp(alpha, 0.0, 0.995);
-
-                    BYTE* px = row + (size_t)x * 4;
-                    px[0] = (BYTE)BhByte(col.b * alpha);
-                    px[1] = (BYTE)BhByte(col.g * alpha);
-                    px[2] = (BYTE)BhByte(col.r * alpha);
-                    px[3] = (BYTE)BhByte(alpha);
-                }
-            }
-        }
-
-        g_blackholePrevDirty = currentDirty;
-        g_blackholePrevDirtyValid = true;
-    }
-
-    // 将提示内容绑定到本次生成的主黑洞，并随其当前大小动态缩放。
-    {
-        Bitmap frameBitmap(W, H, stride, PixelFormat32bppPARGB, frameBits);
-        Graphics g(&frameBitmap);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-        FontFamily ff(L"Microsoft YaHei UI");
-        FontFamily ffFallback(L"Segoe UI");
-        FontFamily* use = ff.IsAvailable() ? &ff : &ffFallback;
-
-        std::wstring detail = g_alertDetail;
-        double elapsedHint = duration<double>(steady_clock::now() - g_alertStarted).count();
-        std::wstring closeHint = (elapsedHint >= 10.0) ? L"按任意键关闭黑洞" : L"10 秒后可按任意键关闭";
-
-        float shadowRadiusPx = (float)(alertRh * H * 0.96);
-        float safeRadius = shadowRadiusPx * 0.72f;
-        if (safeRadius >= 42.0f) {
-            float layoutW = safeRadius * 1.46f;
-            float layoutH = safeRadius * 0.96f;
-            RectF layout(
-                (float)(alertCenter.x * W) - layoutW * 0.5f,
-                (float)(alertCenter.y * H) - layoutH * 0.5f,
-                layoutW,
-                layoutH);
-
-            auto fitSingleLine = [&](const std::wstring& textValue, float startSize, float minSize, float maxWidth, float maxHeight, int styleFlags) {
-                float size = startSize;
-                RectF measured;
-                while (size > minSize) {
-                    Font tryFont(use, size, styleFlags, UnitPixel);
-                    g.MeasureString(textValue.c_str(), (INT)textValue.size(), &tryFont, PointF(0.0f, 0.0f), &measured);
-                    if (measured.Width <= maxWidth && measured.Height <= maxHeight) break;
-                    size -= 1.0f;
-                }
-                if (size < minSize) size = minSize;
-                return size;
-            };
-
-            auto fitWrapped = [&](const std::wstring& textValue, float startSize, float minSize, const RectF& target) {
-                StringFormat fmt(StringFormat::GenericTypographic());
-                fmt.SetAlignment(StringAlignmentCenter);
-                fmt.SetLineAlignment(StringAlignmentCenter);
-                fmt.SetFormatFlags(0);
-                fmt.SetTrimming(StringTrimmingEllipsisWord);
-                float size = startSize;
-                RectF measured;
-                while (size > minSize) {
-                    Font tryFont(use, size, FontStyleRegular, UnitPixel);
-                    RectF bound = target;
-                    g.MeasureString(textValue.c_str(), (INT)textValue.size(), &tryFont, bound, &fmt, &measured);
-                    if (measured.Width <= target.Width + 1.0f && measured.Height <= target.Height + 1.0f) break;
-                    size -= 1.0f;
-                }
-                if (size < minSize) size = minSize;
-                return size;
-            };
-
-            float titleAreaH = layoutH * 0.26f;
-            float detailAreaH = layoutH * 0.33f;
-            float hintAreaH = layoutH * 0.18f;
-            float gapH = layoutH * 0.06f;
-            float blockTop = layout.Y + (layoutH - (titleAreaH + detailAreaH + hintAreaH + gapH * 2.0f)) * 0.5f;
-
-            RectF titleRect(layout.X, blockTop, layout.Width, titleAreaH);
-            RectF detailRect(layout.X, titleRect.Y + titleRect.Height + gapH, layout.Width, detailAreaH);
-            RectF hintRect(layout.X, detailRect.Y + detailRect.Height + gapH, layout.Width, hintAreaH);
-
-            float titleSize = fitSingleLine(g_alertTitle, (float)BhClamp(safeRadius * 0.34f, 14.0f, 56.0f), 10.0f,
-                titleRect.Width * 0.96f, titleRect.Height * 0.96f, FontStyleBold);
-            float detailSize = fitWrapped(detail, (float)BhClamp(safeRadius * 0.19f, 10.0f, 30.0f), 9.0f, detailRect);
-            float hintSize = fitSingleLine(closeHint, (float)BhClamp(safeRadius * 0.16f, 9.0f, 24.0f), 8.0f,
-                hintRect.Width * 0.96f, hintRect.Height * 0.96f, FontStyleRegular);
-
-            Font titleFont(use, titleSize, FontStyleBold, UnitPixel);
-            Font detailFont(use, detailSize, FontStyleRegular, UnitPixel);
-            Font hintFont(use, hintSize, FontStyleRegular, UnitPixel);
-
-            StringFormat fmtCenter(StringFormat::GenericTypographic());
-            fmtCenter.SetAlignment(StringAlignmentCenter);
-            fmtCenter.SetLineAlignment(StringAlignmentCenter);
-            fmtCenter.SetTrimming(StringTrimmingEllipsisWord);
-
-            SolidBrush titleShadow(Color(190, 0, 0, 0));
-            SolidBrush metaShadow(Color(170, 0, 0, 0));
-            SolidBrush titleBrush(Color(255, 248, 250, 255));
-            SolidBrush detailBrush(Color(255, 225, 232, 242));
-            SolidBrush hintBrush(Color(240, 205, 216, 232));
-
-            auto drawCentered = [&](const std::wstring& s, Font& font, const RectF& rect, SolidBrush& mainBrush, SolidBrush& shadowBrush) {
-                RectF shadowRect = rect;
-                shadowRect.X += 1.6f;
-                shadowRect.Y += 1.6f;
-                g.DrawString(s.c_str(), (INT)s.size(), &font, shadowRect, &fmtCenter, &shadowBrush);
-                g.DrawString(s.c_str(), (INT)s.size(), &font, rect, &fmtCenter, &mainBrush);
-            };
-
-            drawCentered(g_alertTitle, titleFont, titleRect, titleBrush, titleShadow);
-            drawCentered(detail, detailFont, detailRect, detailBrush, metaShadow);
-            drawCentered(closeHint, hintFont, hintRect, hintBrush, metaShadow);
-        }
-    }
-
-    POINT ptDst = { vx, vy };
-    SIZE sz = { W, H };
-    POINT ptSrc = { 0, 0 };
-    BLENDFUNCTION bf = { AC_SRC_OVER, 0, BH_ALERT_LAYER_ALPHA, AC_SRC_ALPHA };
-    UpdateLayeredWindow(hwnd, screen, &ptDst, &sz, g_blackholeRenderDC, &ptSrc, 0, &bf, ULW_ALPHA);
-
-    ReleaseDC(NULL, screen);
-}
-
 enum TipRowType { RT_SPACER, RT_HEADING, RT_META, RT_TODO };
 struct TipRow {
     TipRowType type;
     std::wstring text;
     float w;
+    float tw;          // 纯文字宽度（删除线动画用）
     float h;
     float y;
     int sourceIndex;
     bool completed;
+    std::wstring key;  // 待办的原始文本（计时器的键）
 };
+
+static const double ANIM_PI = 3.14159265358979323846;
+static double Clamp01(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
+static double EaseOutCubic(double t) { t = Clamp01(t); double u = 1.0 - t; return 1.0 - u * u * u; }
+static double EaseInOutCubic(double t) { t = Clamp01(t); return t < 0.5 ? 4.0 * t * t * t : 1.0 - std::pow(-2.0 * t + 2.0, 3.0) / 2.0; }
+static double EaseOutBack(double t)
+{
+    t = Clamp01(t);
+    const double c1 = 1.70158, c3 = c1 + 1.0;
+    return 1.0 + c3 * std::pow(t - 1.0, 3.0) + c1 * std::pow(t - 1.0, 2.0);
+}
+static Gdiplus::Color LerpColor(const Gdiplus::Color& a, const Gdiplus::Color& b, double t)
+{
+    t = Clamp01(t);
+    auto L = [&](BYTE x, BYTE y) { return (BYTE)ClampByte(x + (y - x) * t); };
+    return Gdiplus::Color(L(a.GetA(), b.GetA()), L(a.GetR(), b.GetR()), L(a.GetG(), b.GetG()), L(a.GetB(), b.GetB()));
+}
+static Gdiplus::Color WithAlpha(const Gdiplus::Color& c, double a)
+{
+    return Gdiplus::Color((BYTE)ClampByte(a), c.GetR(), c.GetG(), c.GetB());
+}
+
+// 对勾（按路径长度比例 t 逐步描绘）
+static void DrawTick(Gdiplus::Graphics& g, float x, float y, float d, double t, const Gdiplus::Color& c, float width)
+{
+    using namespace Gdiplus;
+    if (t <= 0.0) return;
+    PointF p0(x + d * 0.23f, y + d * 0.53f), p1(x + d * 0.43f, y + d * 0.72f), p2(x + d * 0.78f, y + d * 0.28f);
+    double l1 = std::hypot(p1.X - p0.X, p1.Y - p0.Y), l2 = std::hypot(p2.X - p1.X, p2.Y - p1.Y);
+    double len = (l1 + l2) * Clamp01(t);
+    Pen pen(c, width);
+    pen.SetStartCap(LineCapRound);
+    pen.SetEndCap(LineCapRound);
+    pen.SetLineJoin(LineJoinRound);
+    if (len <= l1) {
+        float k = (float)(len / l1);
+        g.DrawLine(&pen, p0, PointF(p0.X + (p1.X - p0.X) * k, p0.Y + (p1.Y - p0.Y) * k));
+    } else {
+        float k = (float)((len - l1) / l2);
+        PointF pts[3] = { p0, p1, PointF(p1.X + (p2.X - p1.X) * k, p1.Y + (p2.Y - p1.Y) * k) };
+        g.DrawLines(&pen, pts, 3);
+    }
+}
+
+// 阴影位图缓存：高斯模糊是渲染里最贵的一步，尺寸不变时复用（计时/动画需要频繁重绘）
+static Gdiplus::Bitmap* g_shadowCache = nullptr;
+static int g_shadowKey[6] = { 0 };
 
 void RenderTip(HWND hwnd)
 {
     using namespace Gdiplus;
 
-    if (g_alertActive) {
-        g_todoHitRects.clear();
-        RenderBlackHoleAlert(hwnd);
-        return;
-    }
+    if (!g_taskTimersLoaded) LoadTaskTimers();
+    auto nowSteady = steady_clock::now();
+    double alertT = g_alertActive ? duration<double>(nowSteady - g_alertStarted).count() : 0.0;
+    double pulse = g_alertActive ? 0.5 + 0.5 * std::sin(alertT * 2.0 * ANIM_PI / 1.4) : 0.0;
 
     // ---- 读取并解析行 ----
     std::vector<std::wstring> raw;
@@ -2690,18 +2075,21 @@ void RenderTip(HWND hwnd)
     int todoExtra = lineHeight - fontHeight; if (todoExtra < 0) todoExtra = 0;
     int todoGap = (int)(base * 0.45f) + todoExtra;
     int M       = (int)(base * 2.10f); // 阴影外扩边距（需 > 模糊半径）
-    if (g_alertActive && M > 180) M = 180;
     float radius = base * 0.70f;
 
     // 卡片背景由 g_bgAlpha / g_bgColor 控制（可在托盘菜单调整）
 
-    const std::wstring& activeFont = (g_alertActive && !g_alertFontFamily.empty()) ? g_alertFontFamily : g_fontFamily;
-    FontFamily* famText = PickFamily({ activeFont.c_str(), L"Microsoft YaHei UI", L"Microsoft YaHei", L"\u5fae\u8f6f\u96c5\u9ed1" });
-    FontFamily* famHead = PickFamily({ activeFont.c_str(), L"Microsoft YaHei Light", L"Microsoft YaHei UI Light", L"Microsoft YaHei UI", L"Microsoft YaHei" });
+    FontFamily* famText = PickFamily({ g_fontFamily.c_str(), L"Microsoft YaHei UI", L"Microsoft YaHei", L"微软雅黑" });
+    FontFamily* famHead = PickFamily({ g_fontFamily.c_str(), L"Microsoft YaHei Light", L"Microsoft YaHei UI Light", L"Microsoft YaHei UI", L"Microsoft YaHei" });
+    FontFamily* famNum  = PickFamily({ L"Segoe UI", L"Microsoft YaHei UI", L"Arial" });   // 等宽数字，计时不跳动
     Font fHead(famHead, headSz, FontStyleRegular, UnitPixel);
     Font fText(famText, base,   FontStyleRegular, UnitPixel);
     Font fTextDone(famText, base, FontStyleStrikeout, UnitPixel);
     Font fMeta(famText, metaSz, FontStyleRegular, UnitPixel);
+    Font fTimer(famNum, base * 0.66f, FontStyleRegular, UnitPixel);
+    Font fBTitle(famText, base * 0.88f, FontStyleBold, UnitPixel);
+    Font fBDetail(famText, base * 0.64f, FontStyleRegular, UnitPixel);
+    Font fBtn(famText, base * 0.58f, FontStyleBold, UnitPixel);
 
     StringFormat fmt(StringFormat::GenericTypographic());
     fmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
@@ -2721,6 +2109,7 @@ void RenderTip(HWND hwnd)
 
         TipRow r;
         r.w = 0;
+        r.tw = 0;
         r.h = 0;
         r.y = 0;
         r.sourceIndex = fileOk ? (int)i : -1;
@@ -2742,6 +2131,7 @@ void RenderTip(HWND hwnd)
             r.type = fileOk ? RT_TODO : RT_META;
             r.text = ProcessPlaceholdersW(todoText.empty() && !fileOk ? raw[i] : todoText);
             r.completed = completed;
+            r.key = TrimCopy(todoText);
         }
         rows.push_back(r);
     }
@@ -2767,6 +2157,24 @@ void RenderTip(HWND hwnd)
         return bb;
     };
 
+    // ---- 计时胶囊尺寸：同一列右对齐，宽度按模板测量，数字变化时不抖动 ----
+    float pillH = base * 1.08f;
+    float ringD = pillH * 0.56f;
+    float pillPadX = base * 0.40f;
+    float pillInnerGap = base * 0.30f;
+    float pillGap = base * 0.75f;
+    float pillColW = 0.0f;
+    for (const auto& r : rows) {
+        if (r.type != RT_TODO) continue;
+        TaskTimer* t = FindTaskTimer(r.key);
+        if (!t) continue;
+        long long el = TimerElapsed(*t);
+        long long span = t->countdown ? (std::max)(t->duration, el - t->duration) : el;
+        RectF bb = measure(span >= 3600 ? L"+88:88:88" : L"+88:88", fTimer);
+        float w = pillPadX * 2 + ringD + pillInnerGap + bb.Width;
+        if (w > pillColW) pillColW = w;
+    }
+
     // ---- 第一遍：测量 + 计算布局 ----
     float contentW = base * 4.0f;
     for (auto& r : rows) {
@@ -2774,13 +2182,39 @@ void RenderTip(HWND hwnd)
         Font* f = (r.type == RT_HEADING) ? &fHead : (r.type == RT_META) ? &fMeta : &fText;
         RectF bb = measure(r.text, *f);
         r.h = bb.Height;
+        r.tw = bb.Width;
         r.w = bb.Width + (r.type == RT_TODO ? (float)(checkD + checkGap) : 0.0f);
+        if (r.type == RT_TODO && pillColW > 0 && FindTaskTimer(r.key)) r.w += pillGap + pillColW;
         if (r.w > contentW) contentW = r.w;
     }
 
+    // ---- 提醒横幅尺寸 ----
+    float bPad = base * 0.62f, iconD = base * 1.5f, btnH = base * 1.25f, btnPadX = base * 0.72f, btnGap = base * 0.36f;
+    float bannerH = 0.0f, bTitleH = 0.0f, bDetailH = 0.0f, bHeadBlock = 0.0f;
+    auto btnSpec = BannerButtonSpec();
+    std::vector<float> btnW;
+    if (g_alertActive) {
+        RectF tb = measure(g_alertTitle, fBTitle), db = measure(g_alertDetail, fBDetail);
+        bTitleH = tb.Height; bDetailH = db.Height;
+        float textW = (std::max)(tb.Width, db.Width);
+        float btnsW = 0.0f;
+        for (const auto& b : btnSpec) {
+            float w = measure(b.second, fBtn).Width + btnPadX * 2;
+            btnW.push_back(w);
+            btnsW += w;
+        }
+        btnsW += btnGap * (float)(btnSpec.size() - 1);
+        float need = (std::max)(bPad + iconD + bPad * 0.8f + textW + bPad, bPad * 2 + btnsW);
+        bHeadBlock = (std::max)(iconD, bTitleH + base * 0.12f + bDetailH);
+        bannerH = bPad + bHeadBlock + base * 0.6f + btnH + bPad;
+        if (need > contentW) contentW = need;
+    }
+
     float y = (float)PADTOP;
+    float bannerY = y;
+    if (g_alertActive) y += bannerH + base * 0.85f;
     float dividerY = -1.0f;
-    bool placedDivider = false, seenContent = false;
+    bool placedDivider = false, seenContent = g_alertActive;
     float lastGap = 0.0f;
     for (auto& r : rows) {
         if (r.type == RT_SPACER) { y += r.h; lastGap = 0; continue; }
@@ -2797,24 +2231,6 @@ void RenderTip(HWND hwnd)
     y -= lastGap;
     int cardW = (int)(contentW + PADX * 2 + 0.5f);
     int cardH = (int)(y + PADBOT + 0.5f);
-
-    if (g_alertActive) {
-        int virtualW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int virtualH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        int maxCardW = virtualW - 2 * M - 20;
-        int maxCardH = virtualH - 2 * M - 20;
-        if (maxCardW < 220) maxCardW = 220;
-        if (maxCardH < 140) maxCardH = 140;
-
-        int targetW = (int)(g_alertCardW + 0.5);
-        int targetH = (int)(g_alertCardH + 0.5);
-        if (targetW > maxCardW) targetW = maxCardW;
-        if (targetH > maxCardH) targetH = maxCardH;
-        if (cardW < targetW) cardW = targetW;
-        if (cardH < targetH) cardH = targetH;
-        if (cardW > maxCardW) cardW = maxCardW;
-        if (cardH > maxCardH) cardH = maxCardH;
-    }
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     if (cardW > screenW - 20) cardW = screenW - 20;
@@ -2842,29 +2258,34 @@ void RenderTip(HWND hwnd)
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 
-    // 柔和阴影：独立位图画卡片轮廓 → 高斯模糊 → 挖空卡片内部 → 叠到底层
+    // 柔和阴影：独立位图画卡片轮廓 → 高斯模糊 → 挖空卡片内部 → 叠到底层（结果按尺寸缓存）
     {
-        float blurR = base * 0.95f; if (blurR < 8) blurR = 8; if (blurR > 56) blurR = 56;
-        float shDy = base * 0.35f;
-        Bitmap shadowBmp(W, H, PixelFormat32bppARGB);
-        Graphics sg(&shadowBmp);
-        sg.Clear(Color(0, 0, 0, 0));
-        sg.SetSmoothingMode(SmoothingModeAntiAlias);
-        GraphicsPath sp;
-        RoundRectPath(sp, (float)M, (float)M + shDy, (float)cardW, (float)cardH, radius);
-        SolidBrush sb(Color(130, 0, 0, 0));
-        sg.FillPath(&sb, &sp);
-        Blur blur;
-        BlurParams bp; bp.radius = blurR; bp.expandEdge = FALSE;
-        blur.SetParameters(&bp);
-        shadowBmp.ApplyEffect(&blur, NULL);
-        // 挖掉卡片正下方的阴影，避免半透明卡片中心发灰
-        GraphicsPath hole;
-        RoundRectPath(hole, (float)M, (float)M, (float)cardW, (float)cardH, radius);
-        sg.SetCompositingMode(CompositingModeSourceCopy);
-        SolidBrush clearB(Color(0, 0, 0, 0));
-        sg.FillPath(&clearB, &hole);
-        g.DrawImage(&shadowBmp, 0, 0);
+        int key[6] = { W, H, cardW, cardH, (int)(radius * 100), (int)(base * 100) };
+        if (!g_shadowCache || memcmp(key, g_shadowKey, sizeof(key)) != 0) {
+            delete g_shadowCache;
+            g_shadowCache = new Bitmap(W, H, PixelFormat32bppARGB);
+            float blurR = base * 0.95f; if (blurR < 8) blurR = 8; if (blurR > 56) blurR = 56;
+            float shDy = base * 0.35f;
+            Graphics sg(g_shadowCache);
+            sg.Clear(Color(0, 0, 0, 0));
+            sg.SetSmoothingMode(SmoothingModeAntiAlias);
+            GraphicsPath sp;
+            RoundRectPath(sp, (float)M, (float)M + shDy, (float)cardW, (float)cardH, radius);
+            SolidBrush sb(Color(130, 0, 0, 0));
+            sg.FillPath(&sb, &sp);
+            Blur blur;
+            BlurParams bp; bp.radius = blurR; bp.expandEdge = FALSE;
+            blur.SetParameters(&bp);
+            g_shadowCache->ApplyEffect(&blur, NULL);
+            // 挖掉卡片正下方的阴影，避免半透明卡片中心发灰
+            GraphicsPath hole;
+            RoundRectPath(hole, (float)M, (float)M, (float)cardW, (float)cardH, radius);
+            sg.SetCompositingMode(CompositingModeSourceCopy);
+            SolidBrush clearB(Color(0, 0, 0, 0));
+            sg.FillPath(&clearB, &hole);
+            memcpy(g_shadowKey, key, sizeof(key));
+        }
+        g.DrawImage(g_shadowCache, 0, 0);
     }
 
     // 卡片底 + 发丝描边
@@ -2875,87 +2296,293 @@ void RenderTip(HWND hwnd)
     Pen border(Color(24, 255, 255, 255), 1.0f);
     g.DrawPath(&border, &cp);
 
+    // 提醒中：卡片边缘呼吸光
+    if (g_alertActive) {
+        for (int k = 3; k >= 1; --k) {
+            Pen gp(Color((BYTE)ClampByte((22.0 + 34.0 * pulse) * (4 - k) / 3.0), 255, 107, 107), (REAL)(k * 2.2f));
+            g.DrawPath(&gp, &cp);
+        }
+        Pen bp(Color((BYTE)ClampByte(110.0 + 120.0 * pulse), 255, 128, 112), 1.6f);
+        g.DrawPath(&bp, &cp);
+    }
+
     // 颜色
-    Color ink(255, GetRValue(g_textColor), GetGValue(g_textColor), GetBValue(g_textColor));
-    Color checkc(235, GetRValue(g_textColor), GetGValue(g_textColor), GetBValue(g_textColor));
-    Color doneInk(155,
-        ClampByte(GetRValue(g_textColor) * 0.55),
-        ClampByte(GetGValue(g_textColor) * 0.55),
-        ClampByte(GetBValue(g_textColor) * 0.55));
-    Color doneCheck(165,
-        ClampByte(GetRValue(g_textColor) * 0.52),
-        ClampByte(GetGValue(g_textColor) * 0.52),
-        ClampByte(GetBValue(g_textColor) * 0.52));
-    Color doneFill(36,
-        ClampByte(GetRValue(g_textColor) * 0.45),
-        ClampByte(GetGValue(g_textColor) * 0.45),
-        ClampByte(GetBValue(g_textColor) * 0.45));
+    BYTE TR = GetRValue(g_textColor), TG = GetGValue(g_textColor), TB = GetBValue(g_textColor);
+    Color ink(255, TR, TG, TB);
+    Color checkc(235, TR, TG, TB);
+    Color doneInk(155, ClampByte(TR * 0.55), ClampByte(TG * 0.55), ClampByte(TB * 0.55));
+    Color doneCheck(165, ClampByte(TR * 0.52), ClampByte(TG * 0.52), ClampByte(TB * 0.52));
+    Color doneFill(36, ClampByte(TR * 0.45), ClampByte(TG * 0.45), ClampByte(TB * 0.45));
     Color meta(255, 169, 175, 189);
     Color shadowc(90, 0, 0, 0);
+    Color accentDone(255, 52, 211, 153);    // 完成：翡翠绿
+    Color accentGold(255, 253, 224, 71);
+    Color coral(255, 255, 107, 107);        // 到点：珊瑚红
+    Color amber(255, 251, 191, 36);         // 快到点：琥珀
+    Color sky(255, 125, 211, 252);          // 倒计时：天蓝
+    Color violet(255, 196, 181, 253);       // 正计时：淡紫
     float sdy = base * 0.045f; if (sdy < 1) sdy = 1;
 
     auto drawText = [&](const std::wstring& str, Font& f, float tx, float ty, Color c) {
         if (str.empty()) return;
-        SolidBrush shb(shadowc);
+        SolidBrush shb(WithAlpha(shadowc, shadowc.GetA() * c.GetA() / 255.0));
         g.DrawString(str.c_str(), (INT)str.size(), &f, PointF(tx, ty + sdy), &fmt, &shb);
         SolidBrush br(c);
         g.DrawString(str.c_str(), (INT)str.size(), &f, PointF(tx, ty), &fmt, &br);
     };
 
     float bx = (float)(M + PADX);
+    float rightX = (float)(M + cardW - PADX);
     if (dividerY >= 0) {
         Pen dp(Color(30, 255, 255, 255), 1.0f);
         float dyv = M + dividerY;
-        g.DrawLine(&dp, bx, dyv, (float)(M + cardW - PADX), dyv);
+        g.DrawLine(&dp, bx, dyv, rightX, dyv);
     }
 
+    // ---- 提醒横幅 ----
+    g_bannerButtons.clear();
+    if (g_alertActive) {
+        double e = EaseOutCubic(alertT / 0.38);              // 入场：下滑 + 淡入
+        double A = 255.0 * e;
+        float bw = rightX - bx;
+        float byT = M + bannerY - (float)((1.0 - e) * base * 0.6);
+        float br = base * 0.55f;
+        for (int k = 1; k <= 3; ++k) {                         // 外圈呼吸光
+            GraphicsPath gp2;
+            RoundRectPath(gp2, bx - k * 1.6f, byT - k * 1.6f, bw + k * 3.2f, bannerH + k * 3.2f, br + k * 1.6f);
+            Pen pp(Color((BYTE)ClampByte(e * (40.0 + 60.0 * pulse) / k), 255, 120, 100), 1.6f);
+            g.DrawPath(&pp, &gp2);
+        }
+        GraphicsPath bpth;
+        RoundRectPath(bpth, bx, byT, bw, bannerH, br);
+        LinearGradientBrush lg(PointF(bx, byT), PointF(bx + bw, byT + bannerH),
+            Color((BYTE)ClampByte(A * 0.96), 255, 95, 109), Color((BYTE)ClampByte(A * 0.96), 255, 166, 77));
+        g.FillPath(&lg, &bpth);
+        {
+            GraphicsPath hp;
+            RoundRectPath(hp, bx + 1, byT + 1, bw - 2, bannerH - 2, br - 1);
+            Pen hpen(Color((BYTE)ClampByte(A * 0.25), 255, 255, 255), 1.0f);
+            g.DrawPath(&hpen, &hp);
+        }
+
+        // 闹钟图标（抖动时轻轻摇摆）
+        float icx = bx + bPad + iconD / 2, icy = byT + bPad + bHeadBlock / 2;
+        double wig = 0.0;
+        if (g_shaking) {
+            double st = duration<double>(nowSteady - g_shakeStart).count();
+            wig = 18.0 * std::sin(st * 2.0 * ANIM_PI * 6.0) * (1.0 - Clamp01(st / SHAKE_SEC));
+        }
+        GraphicsState gs = g.Save();
+        g.TranslateTransform(icx, icy);
+        g.RotateTransform((REAL)wig);
+        SolidBrush icBg(Color((BYTE)ClampByte(A * 0.24), 255, 255, 255));
+        g.FillEllipse(&icBg, -iconD / 2, -iconD / 2, iconD, iconD);
+        float cr = iconD * 0.25f, sw = (std::max)(1.4f, base * 0.075f), cyo = iconD * 0.05f;
+        Pen wp(Color((BYTE)ClampByte(A), 255, 255, 255), sw);
+        wp.SetStartCap(LineCapRound);
+        wp.SetEndCap(LineCapRound);
+        g.DrawEllipse(&wp, -cr, cyo - cr, cr * 2, cr * 2);
+        g.DrawLine(&wp, 0.0f, cyo, 0.0f, cyo - cr * 0.55f);
+        g.DrawLine(&wp, 0.0f, cyo, cr * 0.42f, cyo + cr * 0.22f);
+        float er = cr * 0.48f;
+        g.DrawArc(&wp, -cr * 0.85f - er, cyo - cr * 0.95f - er, er * 2, er * 2, 190, 100);
+        g.DrawArc(&wp, cr * 0.85f - er, cyo - cr * 0.95f - er, er * 2, er * 2, 250, 100);
+        g.DrawLine(&wp, -cr * 0.62f, cyo + cr * 0.86f, -cr * 0.86f, cyo + cr * 1.14f);
+        g.DrawLine(&wp, cr * 0.62f, cyo + cr * 0.86f, cr * 0.86f, cyo + cr * 1.14f);
+        g.Restore(gs);
+
+        float tx = bx + bPad + iconD + bPad * 0.8f;
+        float ty = byT + bPad + (bHeadBlock - (bTitleH + base * 0.12f + bDetailH)) / 2;
+        SolidBrush tbr(Color((BYTE)ClampByte(A), 255, 255, 255));
+        g.DrawString(g_alertTitle.c_str(), (INT)g_alertTitle.size(), &fBTitle, PointF(tx, ty), &fmt, &tbr);
+        SolidBrush dbr(Color((BYTE)ClampByte(A * 0.88), 255, 255, 255));
+        g.DrawString(g_alertDetail.c_str(), (INT)g_alertDetail.size(), &fBDetail, PointF(tx, ty + bTitleH + base * 0.12f), &fmt, &dbr);
+
+        // 按钮（右对齐；第一个为主按钮）
+        float byB = byT + bannerH - bPad - btnH;
+        float cx = bx + bw - bPad;
+        for (int i = (int)btnSpec.size() - 1; i >= 0; --i) {
+            cx -= btnW[(size_t)i];
+            bool primary = (i == 0);
+            GraphicsPath bpp;
+            RoundRectPath(bpp, cx, byB, btnW[(size_t)i], btnH, btnH / 2);
+            SolidBrush bfill(primary ? Color((BYTE)ClampByte(A * 0.96), 255, 255, 255) : Color((BYTE)ClampByte(A * 0.22), 255, 255, 255));
+            g.FillPath(&bfill, &bpp);
+            const std::wstring& label = btnSpec[(size_t)i].second;
+            RectF lb = measure(label, fBtn);
+            SolidBrush lbr(primary ? Color((BYTE)ClampByte(A), 225, 72, 82) : Color((BYTE)ClampByte(A), 255, 255, 255));
+            g.DrawString(label.c_str(), (INT)label.size(), &fBtn,
+                PointF(cx + (btnW[(size_t)i] - lb.Width) / 2, byB + (btnH - lb.Height) / 2), &fmt, &lbr);
+            RECT rc = { (LONG)cx, (LONG)byB, (LONG)(cx + btnW[(size_t)i]), (LONG)(byB + btnH) };
+            g_bannerButtons.push_back({ rc, btnSpec[(size_t)i].first });
+            cx -= btnGap;
+        }
+    }
+
+    // ---- 各行 ----
     g_todoHitRects.clear();
+    g_rowHitRects.clear();
+    g_pillHitRects.clear();
+    std::unordered_map<std::wstring, float> rowY;
+    double settleT = g_settling ? EaseOutCubic(duration<double>(nowSteady - g_settleStart).count() / SETTLE_ANIM_SEC) : 1.0;
+    double animP = g_completeAnim.active ? Clamp01(duration<double>(nowSteady - g_completeAnim.start).count() / COMPLETE_ANIM_SEC) : 0.0;
+
     for (auto& r : rows) {
         if (r.type == RT_SPACER) continue;
         float ry = M + r.y;
-        if (r.type == RT_HEADING) drawText(r.text, fHead, bx, ry, ink);
-        else if (r.type == RT_META) drawText(r.text, fMeta, bx, ry, meta);
-        else {
-            float rh = (r.h > checkD ? r.h : (float)checkD);
-            float cy = ry + rh / 2.0f - checkD / 2.0f;
-            float stroke = base * 0.06f; if (stroke < 1.25f) stroke = 1.25f;
-            Color boxColor = r.completed ? doneCheck : checkc;
+        if (r.type == RT_HEADING) { drawText(r.text, fHead, bx, ry, ink); continue; }
+        if (r.type == RT_META) { drawText(r.text, fMeta, bx, ry, meta); continue; }
 
+        // 已完成项沉底时，从旧位置平滑滑到新位置
+        if (g_settling) {
+            auto it = g_settleFrom.find(r.key);
+            if (it != g_settleFrom.end()) ry = (float)(M + it->second + (r.y - it->second) * settleT);
+        }
+        if (!rowY.count(r.key)) rowY[r.key] = ry - M;
+
+        float rh = (r.h > checkD ? r.h : (float)checkD);
+        float cy = ry + rh / 2.0f - checkD / 2.0f;
+        float stroke = base * 0.06f; if (stroke < 1.25f) stroke = 1.25f;
+        float textX = bx + checkD + checkGap;
+        float rowL = bx - base * 0.35f, rowR = rightX + base * 0.35f;
+        float rowT = ry - base * 0.22f, rowHt = rh + base * 0.44f;
+        bool animating = g_completeAnim.active && !r.completed && r.key == g_completeAnim.key;
+        bool alerting = g_alertActive && !g_alertTaskKey.empty() && !r.completed && r.key == g_alertTaskKey;
+
+        if (alerting || animating) {
+            GraphicsPath hp;
+            RoundRectPath(hp, rowL, rowT, rowR - rowL, rowHt, base * 0.35f);
+            SolidBrush hb(alerting ? WithAlpha(coral, 26.0 + 34.0 * pulse) : WithAlpha(accentDone, 34.0 * std::sin(ANIM_PI * animP)));
+            g.FillPath(&hb, &hp);
+        }
+
+        if (animating) {
+            // 完成动画：涟漪 + 光点 + 复选框弹出填充 + 对勾描绘 + 删除线划过
+            double pf = EaseOutBack(animP / 0.32);
+            double pt = Clamp01((animP - 0.16) / 0.30);
+            double pr = Clamp01(animP / 0.80);
+            double ps = EaseInOutCubic((animP - 0.28) / 0.55);
+            float ccx = bx + checkD / 2.0f, ccy = cy + checkD / 2.0f;
+            {
+                float rr = checkD * (0.55f + 1.30f * (float)EaseOutCubic(pr));
+                Pen rp(WithAlpha(accentDone, 170.0 * (1.0 - pr)), (std::max)(1.0f, stroke * (float)(1.5 - pr)));
+                g.DrawEllipse(&rp, ccx - rr, ccy - rr, rr * 2, rr * 2);
+            }
+            for (int k = 0; k < 8; ++k) {
+                double ang = k * ANIM_PI / 4.0 + 0.39;
+                double dist = checkD * (0.6 + 1.5 * EaseOutCubic(pr));
+                float ds = (float)(checkD * 0.13 * (1.0 - pr));
+                if (ds < 0.3f) continue;
+                SolidBrush sb(WithAlpha(k % 2 == 0 ? accentDone : accentGold, 235.0 * (1.0 - pr)));
+                float sx = ccx + (float)(std::cos(ang) * dist), sy = ccy + (float)(std::sin(ang) * dist);
+                g.FillEllipse(&sb, sx - ds, sy - ds, ds * 2, ds * 2);
+            }
+            Pen boxPen(LerpColor(checkc, accentDone, animP / 0.2), stroke);
+            g.DrawRectangle(&boxPen, bx, cy, (REAL)checkD, (REAL)checkD);
+            float fs = (float)(checkD * pf);
+            if (fs > 0.5f) {
+                SolidBrush fb(accentDone);
+                g.FillRectangle(&fb, ccx - fs / 2, ccy - fs / 2, fs, fs);
+            }
+            DrawTick(g, bx, cy, (float)checkD, pt, Color(255, 255, 255, 255), stroke + 0.35f);
+            Color tc = LerpColor(ink, doneInk, ps);
+            drawText(r.text, fText, textX, ry, tc);
+            if (ps > 0.0) {
+                Pen sp(tc, (std::max)(1.2f, base * 0.06f));
+                float sy = ry + r.h * 0.54f;
+                g.DrawLine(&sp, textX, sy, textX + r.tw * (float)ps, sy);
+            }
+        } else {
+            Color boxColor = r.completed ? doneCheck : checkc;
             if (r.completed) {
                 SolidBrush fill(doneFill);
                 g.FillRectangle(&fill, bx, cy, (REAL)checkD, (REAL)checkD);
             }
-
             Pen boxPen(boxColor, stroke);
             g.DrawRectangle(&boxPen, bx, cy, (REAL)checkD, (REAL)checkD);
-
-            if (r.completed) {
-                Pen tickPen(doneCheck, stroke + 0.35f);
-                tickPen.SetStartCap(LineCapRound);
-                tickPen.SetEndCap(LineCapRound);
-                g.DrawLine(&tickPen,
-                    bx + checkD * 0.23f, cy + checkD * 0.53f,
-                    bx + checkD * 0.43f, cy + checkD * 0.72f);
-                g.DrawLine(&tickPen,
-                    bx + checkD * 0.43f, cy + checkD * 0.72f,
-                    bx + checkD * 0.78f, cy + checkD * 0.28f);
+            if (r.completed) DrawTick(g, bx, cy, (float)checkD, 1.0, doneCheck, stroke + 0.35f);
+            // 刚完成的一项：滑动期间强调色逐渐褪为已完成样式
+            if (r.completed && g_settling && r.key == g_justCompletedKey) {
+                double a = 1.0 - settleT;
+                SolidBrush fb(WithAlpha(accentDone, 255.0 * a));
+                g.FillRectangle(&fb, bx, cy, (REAL)checkD, (REAL)checkD);
+                DrawTick(g, bx, cy, (float)checkD, 1.0, Color((BYTE)ClampByte(255.0 * a), 255, 255, 255), stroke + 0.35f);
             }
-
-            if (r.sourceIndex >= 0) {
-                int inflate = (int)(base * 0.20f); if (inflate < 4) inflate = 4;
-                RECT hit = {
-                    (LONG)(bx - inflate),
-                    (LONG)(cy - inflate),
-                    (LONG)(bx + checkD + inflate),
-                    (LONG)(cy + checkD + inflate)
-                };
-                g_todoHitRects.push_back({ hit, r.sourceIndex });
-            }
-
             Font& todoFont = r.completed ? fTextDone : fText;
-            drawText(r.text, todoFont, bx + checkD + checkGap, ry, r.completed ? doneInk : ink);
+            drawText(r.text, todoFont, textX, ry, r.completed ? doneInk : ink);
+        }
+
+        if (r.sourceIndex >= 0) {
+            int inflate = (int)(base * 0.20f); if (inflate < 4) inflate = 4;
+            RECT hit = { (LONG)(bx - inflate), (LONG)(cy - inflate), (LONG)(bx + checkD + inflate), (LONG)(cy + checkD + inflate) };
+            g_todoHitRects.push_back({ hit, r.sourceIndex, r.key, r.completed });
+            RECT rowRc = { (LONG)rowL, (LONG)rowT, (LONG)rowR, (LONG)(rowT + rowHt) };
+            g_rowHitRects.push_back({ rowRc, r.sourceIndex, r.key, r.completed });
+        }
+
+        // ---- 计时胶囊 ----
+        TaskTimer* tm = (pillColW > 0) ? FindTaskTimer(r.key) : nullptr;
+        if (tm) {
+            float px = rightX - pillColW;
+            float py = ry + rh / 2.0f - pillH / 2.0f;
+            long long el = TimerElapsed(*tm);
+            bool running = tm->start > 0;
+            bool expired = tm->countdown && el >= tm->duration;
+            std::wstring label;
+            double frac = 0.0;
+            Color ringC = sky;
+            if (tm->countdown) {
+                long long rem = tm->duration - el;
+                if (rem > 0) {
+                    label = FormatClock(rem);
+                    frac = tm->duration > 0 ? (double)rem / (double)tm->duration : 0.0;
+                    ringC = (rem <= 60 || rem * 5 <= tm->duration) ? amber : sky;
+                } else {
+                    label = L"+" + FormatClock(-rem);   // 超时多久
+                    frac = 1.0;
+                    ringC = coral;
+                }
+            } else {
+                label = FormatClock(el);
+                frac = (double)(el % 60) / 60.0;
+                ringC = violet;
+            }
+            double fade = r.completed ? 120.0 : (running ? 255.0 : 175.0);
+
+            GraphicsPath pp;
+            RoundRectPath(pp, px, py, pillColW, pillH, pillH / 2);
+            Color pbg = (expired && !r.completed)
+                ? WithAlpha(coral, alerting ? 60.0 + 50.0 * pulse : 52.0)
+                : Color((BYTE)(r.completed ? 14 : 26), TR, TG, TB);
+            SolidBrush pbr(pbg);
+            g.FillPath(&pbr, &pp);
+
+            float rcx = px + pillPadX + ringD / 2.0f, rcy = py + pillH / 2.0f;
+            float rw = (std::max)(1.5f, ringD * 0.16f);
+            float rd = ringD - rw;
+            Pen track(Color((BYTE)ClampByte(fade * 0.28), TR, TG, TB), rw);
+            g.DrawEllipse(&track, rcx - rd / 2, rcy - rd / 2, rd, rd);
+            Pen arc(WithAlpha(ringC, fade), rw);
+            arc.SetStartCap(LineCapRound);
+            arc.SetEndCap(LineCapRound);
+            if (frac >= 0.999) g.DrawEllipse(&arc, rcx - rd / 2, rcy - rd / 2, rd, rd);
+            else if (frac > 0.001) g.DrawArc(&arc, rcx - rd / 2, rcy - rd / 2, rd, rd, -90.0f, (REAL)(360.0 * frac));
+            if (!running) {   // 暂停：中间两道竖线
+                SolidBrush pb(WithAlpha(ringC, fade));
+                float bw2 = (std::max)(1.2f, rw * 0.75f), bh2 = ringD * 0.34f;
+                g.FillRectangle(&pb, rcx - bw2 * 1.6f, rcy - bh2 / 2, bw2, bh2);
+                g.FillRectangle(&pb, rcx + bw2 * 0.6f, rcy - bh2 / 2, bw2, bh2);
+            }
+            RectF lb = measure(label, fTimer);
+            SolidBrush lbr(expired && !r.completed ? WithAlpha(Color(255, 255, 150, 140), fade) : Color((BYTE)ClampByte(fade), TR, TG, TB));
+            g.DrawString(label.c_str(), (INT)label.size(), &fTimer,
+                PointF(rcx + ringD / 2.0f + pillInnerGap, py + (pillH - lb.Height) / 2.0f), &fmt, &lbr);
+
+            RECT prc = { (LONG)px, (LONG)py, (LONG)(px + pillColW), (LONG)(py + pillH) };
+            g_pillHitRects.push_back({ prc, r.sourceIndex, r.key, r.completed });
         }
     }
+    g_lastRowY.swap(rowY);
 
     // ---- 复制到 DIB 并做 alpha 预乘 ----
     BitmapData bd;
@@ -3018,6 +2645,7 @@ void RenderTip(HWND hwnd)
     ReleaseDC(NULL, screen);
     delete famText;
     delete famHead;
+    delete famNum;
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -3053,10 +2681,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     case WM_LBUTTONDOWN:
     {
-        int mx = GET_X_LPARAM(lParam);
-        int my = GET_Y_LPARAM(lParam);
-        if (!g_alertActive && !g_restoringAlert && ToggleTodoAtPoint(hWnd, mx, my)) {
-            return 0;
+        POINT p = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (!g_restoringAlert) {
+            for (const auto& b : g_bannerButtons) {                 // 提醒横幅按钮
+                if (PtInRect(&b.rc, p)) { HandleBannerAction(hWnd, b.action); return 0; }
+            }
+            for (const auto& h : g_pillHitRects) {                  // 计时胶囊：暂停 / 继续
+                if (PtInRect(&h.rc, p)) { ToggleTaskTimerPause(h.key); RenderTip(hWnd); return 0; }
+            }
+            for (const auto& h : g_todoHitRects) {                  // 复选框：完成动画
+                if (PtInRect(&h.rc, p)) { TodoHitRect copy = h; BeginToggle(hWnd, copy); return 0; }
+            }
         }
 
         // 开始拖动：记录光标相对窗口左上角的偏移（屏幕坐标）
@@ -3089,7 +2724,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_RBUTTONUP:
     case WM_CONTEXTMENU:
     {
-        ShowContextMenu(hWnd);
+        ShowContextMenu(hWnd, true);
         return 0;
     }
     case WM_LBUTTONUP:
@@ -3118,9 +2753,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
         KillTimer(hWnd, TIMER_REFRESH);
         KillTimer(hWnd, TIMER_REMINDER_CHECK);
-        KillTimer(hWnd, TIMER_REMINDER_ANIMATE);
+        KillTimer(hWnd, TIMER_ANIM);
         KillTimer(hWnd, TIMER_HOVER_HIDE);
-        UninstallReminderKeyboardHook();
         PostQuitMessage(0);
         return 0;
     case WM_TASKBAR:
@@ -3179,12 +2813,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         if (LOWORD(wParam) == ID_REMINDER_CANCEL) {
             if (g_alertActive) {
-                StopReminderAlert(hWnd);
+                StopCardAlert(hWnd);
             } else {
                 g_reminderArmed = false;
                 g_reminderIsCountdown = false;
                 g_reminderIntervalSeconds = 0;
             }
+        }
+        if (LOWORD(wParam) >= ID_TASK_CD_FIRST && LOWORD(wParam) <= ID_TASK_REMOVE) {
+            HandleTaskTimerCommand(hWnd, LOWORD(wParam));
         }
         if (LOWORD(wParam) == ID_FONTSIZE_INCREASE) {
             fontHeight+=5;
@@ -3265,6 +2902,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
         if (HitTestTodoCheckbox(mx, my) >= 0) return 0;
+        {
+            POINT p = { mx, my };
+            for (const auto& h : g_pillHitRects) if (PtInRect(&h.rc, p)) return 0;
+            for (const auto& b : g_bannerButtons) if (PtInRect(&b.rc, p)) return 0;
+        }
 
         // Prepare SHELLEXECUTEINFO to open Notepad.exe
         SHELLEXECUTEINFO sei = { 0 };
@@ -3311,7 +2953,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     }
     case WM_REMINDER_STOP:
-        StopReminderAlert(hWnd);
+        StopCardAlert(hWnd);
         return 0;
     case WM_TIMER:
         if (wParam == TIMER_REFRESH) {
@@ -3324,9 +2966,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         if (wParam == TIMER_REMINDER_CHECK) {
             CheckReminder(hWnd);
+            CheckTaskTimers(hWnd);
+            if (!g_animTimerOn && AnyTaskTimerRunning()) RenderTip(hWnd);   // 每秒刷新计时显示
         }
-        if (wParam == TIMER_REMINDER_ANIMATE) {
-            AnimateReminderAlert(hWnd);
+        if (wParam == TIMER_ANIM) {
+            TickAnimations(hWnd);
         }
         if (wParam == TIMER_HOVER_HIDE) {
             TickHoverHide(hWnd);
