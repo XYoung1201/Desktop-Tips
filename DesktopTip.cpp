@@ -66,10 +66,12 @@ using namespace std::chrono;
 #define ID_FONT_SELECT 22
 #define ID_COUNTDOWN_1HOUR 23
 #define ID_COUNTDOWN_REPEAT 24
+#define ID_HOVER_HIDE 25
 
 #define TIMER_REFRESH 1
 #define TIMER_REMINDER_CHECK 2
 #define TIMER_REMINDER_ANIMATE 3
+#define TIMER_HOVER_HIDE 4
 
 #define WM_REMINDER_STOP (WM_APP + 1)
 
@@ -138,6 +140,18 @@ static double g_alertCardH = 180.0;
 static std::vector<std::wstring> g_systemFonts;
 static HHOOK g_keyboardHook = NULL;
 static std::mt19937 g_rng((unsigned)steady_clock::now().time_since_epoch().count());
+
+// 置顶时鼠标悬停隐藏：
+//   在「始终置顶」模式下，鼠标移到卡片上时卡片淡出并变为鼠标穿透(WS_EX_TRANSPARENT)，
+//   这样既能常驻最上层，又不会挡住下面窗口的关键信息/点击；鼠标移开后自动淡入恢复。
+//   按住 Ctrl 时卡片保持显示且可正常操作（拖动、勾选待办、右键菜单）。
+//   卡片穿透后收不到 WM_MOUSELEAVE，所以用一个轻量计时器轮询光标位置。
+static bool g_hoverHideEnabled = true;   // 设置项（配置键 HoverHide），默认开启
+static bool g_hoverHidden = false;       // 当前是否处于“悬停隐藏 + 穿透”状态
+static int  g_hoverAlpha = 255;          // 卡片整体不透明度（用于淡入淡出）
+static bool g_contextMenuOpen = false;   // 右键菜单弹出期间不隐藏
+static const int HOVER_HIDE_POLL_MS = 30;
+static const int HOVER_HIDE_FADE_STEP = 64;   // 每次 tick 的 alpha 变化量（约 120ms 完成淡入/淡出）
 
 // 黑洞提醒效果：倒计时/闹钟触发后，先捕获当前页面/桌面作为“采样源”，
 // 但不再把原始页面整张画回输出层。最终输出层只画被黑洞偏折后的像素、
@@ -910,6 +924,67 @@ static bool ShowTextPrompt(HWND owner, const wchar_t* title, const wchar_t* labe
     return false;
 }
 
+static bool HoverHideActive()
+{
+    return g_hoverHideEnabled && g_displayMode == 1 && !g_alertActive && !g_restoringAlert;
+}
+
+static void SetClickThrough(HWND hwnd, bool on)
+{
+    LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    LONG_PTR nex = on ? (ex | WS_EX_TRANSPARENT) : (ex & ~(LONG_PTR)WS_EX_TRANSPARENT);
+    if (nex != ex) SetWindowLongPtr(hwnd, GWL_EXSTYLE, nex);
+}
+
+// 只改整体不透明度，不重新绘制内容（hdcSrc 传 NULL 时 UpdateLayeredWindow 保留现有位图）
+static void ApplyHoverAlpha(HWND hwnd)
+{
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, (BYTE)g_hoverAlpha, AC_SRC_ALPHA };
+    UpdateLayeredWindow(hwnd, NULL, NULL, NULL, NULL, NULL, 0, &bf, ULW_ALPHA);
+}
+
+static void ResetHoverHide(HWND hwnd)
+{
+    KillTimer(hwnd, TIMER_HOVER_HIDE);
+    g_hoverHidden = false;
+    SetClickThrough(hwnd, false);
+    if (g_hoverAlpha != 255) {
+        g_hoverAlpha = 255;
+        ApplyHoverAlpha(hwnd);
+    }
+}
+
+// 根据当前显示模式/设置启动或停止悬停检测
+static void UpdateHoverHideTimer(HWND hwnd)
+{
+    if (HoverHideActive()) SetTimer(hwnd, TIMER_HOVER_HIDE, HOVER_HIDE_POLL_MS, nullptr);
+    else ResetHoverHide(hwnd);
+}
+
+static void TickHoverHide(HWND hwnd)
+{
+    if (!HoverHideActive()) { ResetHoverHide(hwnd); return; }
+
+    POINT pt; GetCursorPos(&pt);
+    RECT wr; GetWindowRect(hwnd, &wr);
+    bool inside = PtInRect(&wr, pt) != FALSE;
+    bool reveal = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;   // 按住 Ctrl：显示并可操作
+    bool busy = g_dragging || g_contextMenuOpen || GetCapture() == hwnd;
+    bool wantHidden = inside && !reveal && !busy;
+
+    if (wantHidden != g_hoverHidden) {
+        g_hoverHidden = wantHidden;
+        SetClickThrough(hwnd, wantHidden);
+    }
+
+    int target = wantHidden ? 0 : 255;
+    if (g_hoverAlpha != target) {
+        if (target > g_hoverAlpha) g_hoverAlpha = (std::min)(target, g_hoverAlpha + HOVER_HIDE_FADE_STEP);
+        else                       g_hoverAlpha = (std::max)(target, g_hoverAlpha - HOVER_HIDE_FADE_STEP);
+        ApplyHoverAlpha(hwnd);
+    }
+}
+
 static void InstallReminderKeyboardHook();
 static void StopReminderAlert(HWND hwnd);
 static void CaptureBlackHoleBackground(HWND hwnd);
@@ -967,6 +1042,7 @@ static double RandomSignedSpeed(double lo, double hi)
 static void StartReminderAlert(HWND hwnd, const std::wstring& title, const std::wstring& detail)
 {
     if (g_alertActive) return;
+    ResetHoverHide(hwnd);   // 提醒全屏动画期间不做悬停隐藏/穿透
     g_alertActive = true;
     g_alertStarted = steady_clock::now();
     g_alertLastFrame = g_alertStarted;
@@ -1055,6 +1131,7 @@ static void StopReminderAlert(HWND hwnd)
 
     ResetBlackHoleAlertState();
     g_restoringAlert = false;
+    UpdateHoverHideTimer(hwnd);   // ApplyDisplayMode 时仍处于恢复阶段，这里补上悬停检测
     confWrite();
 }
 
@@ -1424,6 +1501,9 @@ void ShowContextMenu(HWND hwnd) {
         ID_MODE_DESKTOP, L"附着桌面（Win+D 不最小化）  Attach to desktop");
     AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 1 ? MF_CHECKED : MF_UNCHECKED),
         ID_MODE_TOPMOST, L"始终置顶（Win+D 不影响）  Always on top");
+    AppendMenuW(hModeMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED),
+        ID_HOVER_HIDE, L"置顶时鼠标悬停隐藏（按住 Ctrl 可操作）  Hide on hover when on top");
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"显示模式  Display mode");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EDIT,    L"编辑 TODO  Edit");
@@ -1433,8 +1513,10 @@ void ShowContextMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT,    L"退出  Exit");
     SetMenuDefaultItem(hMenu, ID_SETTINGS, FALSE);
   
-    // 显示菜单
+    // 显示菜单（弹出期间暂停悬停隐藏，避免菜单还开着卡片就消失）
+    g_contextMenuOpen = true;
     TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    g_contextMenuOpen = false;
 
     DestroyMenu(hMenu);
 }
@@ -1590,6 +1672,7 @@ void confWrite() {
     ofs << "FontFamily: " << WideToUtf8(g_fontFamily) << std::endl;
     ofs << "DisplayMode: " << g_displayMode << std::endl;
     ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
+    ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
 }
 
 // 简单的窗口过程，用于绘制文本
@@ -2924,7 +3007,8 @@ void RenderTip(HWND hwnd)
     POINT ptDst = { wr.left, wr.top };
     SIZE  sz = { W, H };
     POINT ptSrc = { 0, 0 };
-    BLENDFUNCTION bf = { AC_SRC_OVER, 0, BH_ALERT_LAYER_ALPHA, AC_SRC_ALPHA };
+    // 普通卡片沿用当前悬停淡入淡出的整体不透明度，避免定时重绘把隐藏中的卡片“闪回来”
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, (BYTE)g_hoverAlpha, AC_SRC_ALPHA };
     UpdateLayeredWindow(hwnd, screen, &ptDst, &sz, memDC, &ptSrc, 0, &bf, ULW_ALPHA);
 
     // ---- 清理 ----
@@ -3035,6 +3119,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         KillTimer(hWnd, TIMER_REFRESH);
         KillTimer(hWnd, TIMER_REMINDER_CHECK);
         KillTimer(hWnd, TIMER_REMINDER_ANIMATE);
+        KillTimer(hWnd, TIMER_HOVER_HIDE);
         UninstallReminderKeyboardHook();
         PostQuitMessage(0);
         return 0;
@@ -3064,6 +3149,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             g_displayMode = 1;          // 始终置顶
             confWrite();
             ApplyDisplayMode(hWnd, 1);
+        }
+        if (LOWORD(wParam) == ID_HOVER_HIDE) {
+            g_hoverHideEnabled = !g_hoverHideEnabled;
+            confWrite();
+            UpdateHoverHideTimer(hWnd);
         }
         if (LOWORD(wParam) == ID_COUNTDOWN_1MIN) {
             ArmCountdown(hWnd, 60);
@@ -3238,6 +3328,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (wParam == TIMER_REMINDER_ANIMATE) {
             AnimateReminderAlert(hWnd);
         }
+        if (wParam == TIMER_HOVER_HIDE) {
+            TickHoverHide(hWnd);
+        }
         break;
     }
 
@@ -3328,6 +3421,7 @@ void ApplyDisplayMode(HWND hwnd, int mode) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
     RenderTip(hwnd);   // 绑定/层级变化后重绘（UpdateLayeredWindow 会按屏幕坐标重新定位）
+    UpdateHoverHideTimer(hwnd);   // 仅「始终置顶」且开启设置时启用悬停隐藏
 }
 
 // 探测“现代独立壁纸层 WorkerW”：即 0x052C 之后由 Explorer 创建、与承载 SHELLDLL_DefView 的
@@ -3447,6 +3541,7 @@ void confCreate() {
         ofs << "FontFamily: " << WideToUtf8(g_fontFamily) << std::endl;
         ofs << "DisplayMode: " << g_displayMode << std::endl;
         ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
+        ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
     }
 }
 
@@ -3509,6 +3604,9 @@ void readFromFile(int& x, int& y) {
         }
         else if (line.find("CountdownRepeat:") == 0) {
             g_countdownRepeatEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
+        }
+        else if (line.find("HoverHide:") == 0) {
+            g_hoverHideEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
         }
     }
 
