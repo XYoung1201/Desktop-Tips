@@ -53,7 +53,7 @@ It keeps the few things that matter today, plus countdowns and date info, in fro
 | Dynamic placeholders | Write `{{TIME}}`, `{{DATE}}`, `{{DAYS_LEFT_YEAR}}` and more; they are replaced on render | One card is a clock, calendar and progress reminder at once |
 | Translucent card | Rounded corners, soft shadow, hairline border; font size, spacing, opacity, colors and font are adjustable | Blends into the wallpaper yet stays legible |
 | Two display modes | "Attach to desktop" stays on the desktop layer; "Always on top" floats above every window | Pick the persistence that fits your workflow |
-| Hide on hover when on top | In "Always on top" mode the card fades out and lets clicks through when the mouse is over it, and comes back when the mouse leaves; hold Ctrl (⌘ on macOS) to interact with the card | Stays on top without covering what's underneath |
+| Hide on hover when on top | In "Always on top" mode the card fades out and lets clicks through once the mouse has hovered over it for a set time (default 1 s; immediately / 0.5 / 1 / 2 / 3 / 5 s), and comes back when the mouse leaves; hold Ctrl (⌘ on macOS) to interact with the card | Stays on top without covering what's underneath |
 | Countdown and alarm | 1 / 5 / 10 min, 1 hour or custom, with optional repeat; or set an alarm time | Pomodoro, meeting and timed reminders in one place |
 | Full-screen alert | A full-screen animation when time is up; click or press a key to stop | Hard to miss, easy to dismiss |
 | Position memory | Drag the card anywhere; position and style are saved and restored | Arrange once, keep it |
@@ -138,7 +138,7 @@ Menu items:
 | Countdown | 1 min / 5 min / 10 min / 1 hour / custom, plus a "Repeat" toggle |
 | Alarm… | Enter `HH:MM` or `HH:MM:SS`; a time already passed means tomorrow |
 | Cancel countdown / alarm, Stop alert | Shown only while armed or alerting, with the remaining time |
-| Display mode | Attach to desktop / Always on top, plus the "Hide on hover when on top" toggle |
+| Display mode | Attach to desktop / Always on top, the "Hide on hover when on top" toggle, and the "Hover delay" |
 | Edit TODO, Refresh, Change TODO file | File operations; the card also refreshes on a timer (every minute on Windows, checked every second on macOS) |
 | Quit | Save the position and exit |
 
@@ -166,6 +166,7 @@ The config is a `key: value` text file, one entry per line. The app writes it wh
 | `DisplayMode` | `0` attach to desktop, `1` always on top | `0` |
 | `CountdownRepeat` | Repeat countdowns, `0` / `1` | `0` |
 | `HoverHide` | Hide the card on hover in always-on-top mode, `0` / `1` | `1` |
+| `HoverHideDelay` | How long the mouse must hover before the card hides (ms), `0` = immediately | `1000` |
 
 Both platforms use the same keys. `Window_X/Y` depends on each system's screen coordinates, so don't copy the config file between machines; copying the TODO file is fine.
 

@@ -22,6 +22,7 @@ struct Config {
     var displayMode = 0          // 0 = 附着桌面, 1 = 始终置顶
     var countdownRepeat = false
     var hoverHide = true         // 始终置顶时鼠标悬停隐藏（按住 ⌘ 可操作）
+    var hoverHideDelay = 1000    // 悬停多久后才隐藏（毫秒）；隐藏后鼠标离开卡片即恢复
 
     var textColor: NSColor { NSColor(srgbRed: CGFloat(text.r) / 255, green: CGFloat(text.g) / 255, blue: CGFloat(text.b) / 255, alpha: 1) }
     var bgColor: NSColor { NSColor(srgbRed: CGFloat(bg.r) / 255, green: CGFloat(bg.g) / 255, blue: CGFloat(bg.b) / 255, alpha: 1) }
@@ -52,6 +53,7 @@ struct Config {
             case "DisplayMode": c.displayMode = n
             case "CountdownRepeat": c.countdownRepeat = n != 0
             case "HoverHide": c.hoverHide = n != 0
+            case "HoverHideDelay": c.hoverHideDelay = max(0, min(60000, n))
             default: break
             }
         }
@@ -67,7 +69,7 @@ struct Config {
         out += "TextColor_R: \(text.r)\nTextColor_G: \(text.g)\nTextColor_B: \(text.b)\n"
         out += "BgAlpha: \(bgAlpha)\nBgColor_R: \(bg.r)\nBgColor_G: \(bg.g)\nBgColor_B: \(bg.b)\n"
         out += "FontFamily: \(fontFamily)\nDisplayMode: \(displayMode)\nCountdownRepeat: \(countdownRepeat ? 1 : 0)\n"
-        out += "HoverHide: \(hoverHide ? 1 : 0)\n"
+        out += "HoverHide: \(hoverHide ? 1 : 0)\nHoverHideDelay: \(hoverHideDelay)\n"
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
@@ -987,6 +989,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     // 移开后淡入恢复；按住 ⌘ 时保持显示、可正常拖动/勾选/右键。
     var hoverTimer: Timer?
     var hoverHidden = false
+    var hoverStart: Date?        // 本次悬停开始时间（用于悬停延时）
     var menuTracking = false
 
     // reminder state
@@ -1061,6 +1064,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
         } else {
             hoverTimer?.invalidate(); hoverTimer = nil
+            hoverStart = nil
             setHoverHidden(false)
         }
     }
@@ -1072,7 +1076,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let reveal = NSEvent.modifierFlags.contains(.command)
         // 卡片可见时按着左键（正在拖动卡片）不隐藏
         let dragging = !hoverHidden && (NSEvent.pressedMouseButtons & 1) != 0
-        setHoverHidden(inside && !reveal && !dragging && !menuTracking)
+        var want = inside && !reveal && !dragging && !menuTracking
+        // 悬停延时：需连续悬停满 hoverHideDelay 才隐藏；已隐藏时鼠标仍在卡片内就保持隐藏
+        if want && !hoverHidden {
+            if hoverStart == nil { hoverStart = Date() }
+            if Date().timeIntervalSince(hoverStart!) * 1000 < Double(cfg.hoverHideDelay) { want = false }
+        } else if !want {
+            hoverStart = nil
+        }
+        setHoverHidden(want)
     }
 
     func setHoverHidden(_ hidden: Bool) {
@@ -1202,6 +1214,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         add(mode, "始终置顶  Always on top", #selector(setMode(_:)), 1, checked: cfg.displayMode == 1)
         mode.addItem(.separator())
         add(mode, "置顶时鼠标悬停隐藏（按住 ⌘ 可操作）  Hide on hover when on top", #selector(toggleHoverHide), checked: cfg.hoverHide)
+        let delay = NSMenu()
+        for ms in [0, 500, 1000, 2000, 3000, 5000] {
+            let title = ms == 0 ? "立即  Immediately" : String(format: "%g 秒  %gs", Double(ms) / 1000, Double(ms) / 1000)
+            add(delay, title, #selector(setHoverDelay(_:)), ms, checked: cfg.hoverHideDelay == ms, enabled: cfg.hoverHide)
+        }
+        let di = NSMenuItem(title: "悬停多久后隐藏  Hover delay", action: nil, keyEquivalent: ""); di.submenu = delay
+        di.isEnabled = cfg.hoverHide; mode.addItem(di)
         let mi = NSMenuItem(title: "显示模式  Display mode", action: nil, keyEquivalent: ""); mi.submenu = mode; m.addItem(mi)
         m.addItem(.separator())
         add(m, "编辑 TODO  Edit", #selector(editTodoAction))
@@ -1220,6 +1239,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
     @objc func setMode(_ s: NSMenuItem) { cfg.displayMode = s.tag; applyMode(); saveConfig(); window.orderFrontRegardless() }
     @objc func toggleHoverHide() { cfg.hoverHide.toggle(); updateHoverHide(); saveConfig() }
+    @objc func setHoverDelay(_ s: NSMenuItem) { cfg.hoverHideDelay = s.tag; hoverStart = nil; saveConfig() }
     @objc func refreshAction() { refresh(force: true) }
     @objc func editTodoAction() { editTodo() }
     func editTodo() { NSWorkspace.shared.open(URL(fileURLWithPath: cfg.todoPath)) }

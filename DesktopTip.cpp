@@ -67,6 +67,8 @@ using namespace std::chrono;
 #define ID_COUNTDOWN_1HOUR 23
 #define ID_COUNTDOWN_REPEAT 24
 #define ID_HOVER_HIDE 25
+// 悬停隐藏延时预设（201..206）
+#define ID_HOVER_DELAY_FIRST 201
 // 单项任务计时（右键某条待办）
 #define ID_TASK_CD_FIRST 101      // 101..108 = 预设倒计时
 #define ID_TASK_CD_CUSTOM 110
@@ -194,6 +196,10 @@ static int  g_hoverAlpha = 255;          // 卡片整体不透明度（用于淡
 static bool g_contextMenuOpen = false;   // 右键菜单弹出期间不隐藏
 static const int HOVER_HIDE_POLL_MS = 30;
 static const int HOVER_HIDE_FADE_STEP = 64;   // 每次 tick 的 alpha 变化量（约 120ms 完成淡入/淡出）
+// 悬停多久后才隐藏（配置键 HoverHideDelay，单位毫秒）；隐藏后鼠标离开卡片即恢复显示
+static int g_hoverHideDelayMs = 1000;
+static ULONGLONG g_hoverStartTick = 0;        // 本次悬停开始的时间（0 = 未在计时）
+static const int kHoverDelayPresetsMs[] = { 0, 500, 1000, 2000, 3000, 5000 };
 
 #define MAX_LOADSTRING 100
 
@@ -852,6 +858,7 @@ static void ResetHoverHide(HWND hwnd)
 {
     KillTimer(hwnd, TIMER_HOVER_HIDE);
     g_hoverHidden = false;
+    g_hoverStartTick = 0;
     SetClickThrough(hwnd, false);
     if (g_hoverAlpha != 255) {
         g_hoverAlpha = 255;
@@ -876,6 +883,15 @@ static void TickHoverHide(HWND hwnd)
     bool reveal = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;   // 按住 Ctrl：显示并可操作
     bool busy = g_dragging || g_contextMenuOpen || GetCapture() == hwnd;
     bool wantHidden = inside && !reveal && !busy;
+    // 悬停延时：需连续悬停满 g_hoverHideDelayMs 才隐藏；已隐藏时只要鼠标仍在卡片内就保持隐藏
+    if (wantHidden && !g_hoverHidden) {
+        ULONGLONG now = GetTickCount64();
+        if (g_hoverStartTick == 0) g_hoverStartTick = now;
+        if (now - g_hoverStartTick < (ULONGLONG)g_hoverHideDelayMs) wantHidden = false;
+    }
+    else if (!wantHidden) {
+        g_hoverStartTick = 0;
+    }
 
     if (wantHidden != g_hoverHidden) {
         g_hoverHidden = wantHidden;
@@ -1781,6 +1797,17 @@ void ShowContextMenu(HWND hwnd, bool fromCard = false) {
     AppendMenuW(hModeMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED),
         ID_HOVER_HIDE, L"置顶时鼠标悬停隐藏（按住 Ctrl 可操作）  Hide on hover when on top");
+    HMENU hDelayMenu = CreatePopupMenu();
+    for (int i = 0; i < (int)(sizeof(kHoverDelayPresetsMs) / sizeof(kHoverDelayPresetsMs[0])); ++i) {
+        int ms = kHoverDelayPresetsMs[i];
+        wchar_t label[64];
+        if (ms == 0) wcscpy_s(label, L"立即  Immediately");
+        else swprintf_s(label, L"%g 秒  %gs", ms / 1000.0, ms / 1000.0);
+        AppendMenuW(hDelayMenu, MF_STRING | (g_hoverHideDelayMs == ms ? MF_CHECKED : MF_UNCHECKED)
+            | (g_hoverHideEnabled ? 0 : MF_GRAYED), ID_HOVER_DELAY_FIRST + i, label);
+    }
+    AppendMenuW(hModeMenu, MF_POPUP | (g_hoverHideEnabled ? 0 : MF_GRAYED), (UINT_PTR)hDelayMenu,
+        L"悬停多久后隐藏  Hover delay");
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"显示模式  Display mode");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EDIT,    L"编辑 TODO  Edit");
@@ -1950,6 +1977,7 @@ void confWrite() {
     ofs << "DisplayMode: " << g_displayMode << std::endl;
     ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
     ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+        ofs << "HoverHideDelay: " << g_hoverHideDelayMs << std::endl;
 }
 
 // 简单的窗口过程，用于绘制文本
@@ -2789,6 +2817,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             confWrite();
             UpdateHoverHideTimer(hWnd);
         }
+        if (LOWORD(wParam) >= ID_HOVER_DELAY_FIRST &&
+            LOWORD(wParam) < ID_HOVER_DELAY_FIRST + (int)(sizeof(kHoverDelayPresetsMs) / sizeof(kHoverDelayPresetsMs[0]))) {
+            g_hoverHideDelayMs = kHoverDelayPresetsMs[LOWORD(wParam) - ID_HOVER_DELAY_FIRST];
+            g_hoverStartTick = 0;
+            confWrite();
+        }
         if (LOWORD(wParam) == ID_COUNTDOWN_1MIN) {
             ArmCountdown(hWnd, 60);
         }
@@ -3186,6 +3220,7 @@ void confCreate() {
         ofs << "DisplayMode: " << g_displayMode << std::endl;
         ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
         ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+        ofs << "HoverHideDelay: " << g_hoverHideDelayMs << std::endl;
     }
 }
 
@@ -3251,6 +3286,9 @@ void readFromFile(int& x, int& y) {
         }
         else if (line.find("HoverHide:") == 0) {
             g_hoverHideEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
+        }
+        else if (line.find("HoverHideDelay:") == 0) {
+            g_hoverHideDelayMs = (std::max)(0, (std::min)(60000, std::stoi(line.substr(line.find(":") + 2))));
         }
     }
 
