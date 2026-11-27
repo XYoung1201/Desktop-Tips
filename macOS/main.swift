@@ -28,6 +28,7 @@ struct Config {
     var surfaceEvery = 45        // 智能浮现：每隔多少分钟轻浮现一次（0 = 关闭）
     var countdownRepeat = false  // 新建独立倒计时时「重复」的默认值
     var hoverHide = true         // 始终置顶时鼠标悬停隐藏（按住 ⌘ 可操作）
+    var hoverHideDelay = 1000    // 悬停多久后才隐藏（毫秒）；隐藏后鼠标离开卡片即恢复
     var showHidden = false       // 临时显示带 _HIDE 的条目（淡显）
     var dueShowAbsolute = false  // 截止时间胶囊显示截止时刻（true）还是剩余时长（false）
     var dueInputMode = 1         // 倒计时对话框默认页：0 = 截止时间，1 = 剩余时长
@@ -64,6 +65,7 @@ struct Config {
             case "SurfaceEvery": c.surfaceEvery = max(0, n)
             case "CountdownRepeat": c.countdownRepeat = n != 0
             case "HoverHide": c.hoverHide = n != 0
+            case "HoverHideDelay": c.hoverHideDelay = max(0, min(60000, n))
             case "ShowHidden": c.showHidden = n != 0
             case "DueDisplay": c.dueShowAbsolute = n != 0
             case "DueInputMode": c.dueInputMode = n == 0 ? 0 : 1
@@ -85,7 +87,7 @@ struct Config {
         out += "FontFamily: \(fontFamily)\nDisplayMode: \(displayMode)\nCountdownRepeat: \(countdownRepeat ? 1 : 0)\n"
         out += "HoverHide: \(hoverHide ? 1 : 0)\nShowHidden: \(showHidden ? 1 : 0)\nSinkCompleted: \(sinkCompleted ? 1 : 0)\n"
         out += "DueDisplay: \(dueShowAbsolute ? 1 : 0)\nDueInputMode: \(dueInputMode)\n"
-        out += "SurfaceLead: \(surfaceLead)\nSurfaceEvery: \(surfaceEvery)\n"
+        out += "SurfaceLead: \(surfaceLead)\nSurfaceEvery: \(surfaceEvery)\nHoverHideDelay: \(hoverHideDelay)\n"
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
@@ -1547,6 +1549,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     // 移开后淡入恢复；按住 ⌘ 时保持显示、可正常拖动/勾选/右键。
     var hoverTimer: Timer?
     var hoverHidden = false
+    var hoverStart: Date?        // 本次悬停开始时间（用于悬停延时）
     var hoverAlphaTarget: CGFloat = 1
     // 智能浮现（显示模式 2）：平时附着桌面；临近截止或定时轻浮现时以“半透明 + 鼠标穿透”浮到最上层，
     // 悬停更淡、按住 ⌘ 才变实可操作；前台全屏时不浮现（到点提醒除外）。
@@ -1647,6 +1650,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
         } else {
             hoverTimer?.invalidate(); hoverTimer = nil
+            hoverStart = nil
             setHoverHidden(false)
         }
     }
@@ -1664,7 +1668,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         // 卡片可见时按着左键（正在拖动卡片）不隐藏
         let dragging = !hoverHidden && (NSEvent.pressedMouseButtons & 1) != 0
-        setHoverHidden(inside && !reveal && !dragging && !menuTracking)
+        var want = inside && !reveal && !dragging && !menuTracking
+        // 悬停延时：需连续悬停满 hoverHideDelay 才隐藏；已隐藏时鼠标仍在卡片内就保持隐藏
+        if want && !hoverHidden {
+            if hoverStart == nil { hoverStart = Date() }
+            if Date().timeIntervalSince(hoverStart!) * 1000 < Double(cfg.hoverHideDelay) { want = false }
+        } else if !want {
+            hoverStart = nil
+        }
+        setHoverHidden(want)
     }
 
     func setHoverHidden(_ hidden: Bool) { setHoverState(clickThrough: hidden, alpha: hidden ? 0 : 1) }
@@ -1847,6 +1859,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             submenu(mode, "定时轻浮现", every)
         }
         add(mode, "置顶时悬停隐藏（按住 ⌘ 可操作）", #selector(toggleHoverHide), checked: cfg.hoverHide, enabled: cfg.displayMode == 1)
+        if cfg.displayMode == 1 && cfg.hoverHide {
+            let delay = NSMenu()
+            for ms in [0, 500, 1000, 2000, 3000, 5000] {
+                add(delay, ms == 0 ? "立即" : String(format: "%g 秒", Double(ms) / 1000), #selector(setHoverDelay(_:)), ms, checked: cfg.hoverHideDelay == ms)
+            }
+            submenu(mode, "悬停多久后隐藏", delay)
+        }
         submenu(m, "显示模式", mode)
         add(m, "外观设置…", #selector(showSettings))
         m.addItem(.separator())
@@ -1872,6 +1891,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc func setSurfaceLead(_ s: NSMenuItem) { cfg.surfaceLead = s.tag; saveConfig(); updatePeek(); refresh(force: true) }
     @objc func setSurfaceEvery(_ s: NSMenuItem) { cfg.surfaceEvery = s.tag; lastGlance = nowEpoch(); saveConfig() }
     @objc func toggleHoverHide() { cfg.hoverHide.toggle(); updateHoverHide(); saveConfig() }
+    @objc func setHoverDelay(_ s: NSMenuItem) { cfg.hoverHideDelay = s.tag; hoverStart = nil; saveConfig() }
     @objc func toggleShowHidden() { animateLayout { cfg.showHidden.toggle() }; saveConfig() }
     @objc func toggleSink() { cfg.sinkCompleted.toggle(); saveConfig(); refresh(force: true) }
     @objc func refreshAction() { refresh(force: true) }

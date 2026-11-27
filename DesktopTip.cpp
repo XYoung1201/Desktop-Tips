@@ -62,6 +62,8 @@ using namespace std::chrono;
 #define ID_SURFACE_EVERY_FIRST 45  // 45..48：每 30/45/60 分钟轻浮现一次 / 关闭
 #define ID_FONT_SELECT 22
 #define ID_HOVER_HIDE 25
+// 悬停隐藏延时预设（201..206）
+#define ID_HOVER_DELAY_FIRST 201
 #define ID_REMINDER_CANCEL 21
 #define ID_NEW_COUNTDOWN 30
 #define ID_SHOW_HIDDEN 31
@@ -207,6 +209,10 @@ static const int HOVER_HIDE_FADE_STEP = 64;   // 每次 tick 的 alpha 变化量
 //     · 每隔 SurfaceEvery 分钟（有未完成事项时）轻浮现 8 秒，扫一眼即沉回桌面。
 //   浮现时不抢焦点、不挡点击；鼠标移上去会更淡，按住 Ctrl 才变实、可勾选/拖动。
 //   前台是全屏程序或演示模式时不浮现（到点提醒除外）。
+// 悬停多久后才隐藏（配置键 HoverHideDelay，单位毫秒）；隐藏后鼠标离开卡片即恢复显示
+static int g_hoverHideDelayMs = 1000;
+static ULONGLONG g_hoverStartTick = 0;        // 本次悬停开始的时间（0 = 未在计时）
+static const int kHoverDelayPresetsMs[] = { 0, 500, 1000, 2000, 3000, 5000 };
 static int  g_surfaceLeadMin = 10;      // 配置键 SurfaceLead
 static int  g_surfaceEveryMin = 45;     // 配置键 SurfaceEvery，0 = 关闭定时轻浮现
 static bool g_peekActive = false;       // 当前是否浮在最上层（轻浮层）
@@ -968,6 +974,7 @@ static void ResetHoverHide(HWND hwnd)
 {
     KillTimer(hwnd, TIMER_HOVER_HIDE);
     g_hoverHidden = false;
+    g_hoverStartTick = 0;
     SetClickThrough(hwnd, false);
     if (g_hoverAlpha != 255) {
         g_hoverAlpha = 255;
@@ -999,6 +1006,15 @@ static void TickHoverHide(HWND hwnd)
         target = interactive ? 255 : (inside ? PEEK_HOVER_ALPHA : PEEK_ALPHA);
     } else {
         wantHidden = inside && !reveal && !busy;
+        // 悬停延时：需连续悬停满 g_hoverHideDelayMs 才隐藏；已隐藏时只要鼠标仍在卡片内就保持隐藏
+        if (wantHidden && !g_hoverHidden) {
+            ULONGLONG nowTick = GetTickCount64();
+            if (g_hoverStartTick == 0) g_hoverStartTick = nowTick;
+            if (nowTick - g_hoverStartTick < (ULONGLONG)g_hoverHideDelayMs) wantHidden = false;
+        }
+        else if (!wantHidden) {
+            g_hoverStartTick = 0;
+        }
         target = wantHidden ? 0 : 255;
     }
 
@@ -2451,6 +2467,18 @@ void ShowContextMenu(HWND hwnd, bool fromCard = false) {
     }
     AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED) | (g_displayMode == 1 ? 0 : MF_GRAYED),
         ID_HOVER_HIDE, L"置顶时悬停隐藏（按住 Ctrl 可操作）");
+    {
+        HMENU hDelayMenu = CreatePopupMenu();
+        bool on = g_hoverHideEnabled && g_displayMode == 1;
+        for (int i = 0; i < (int)(sizeof(kHoverDelayPresetsMs) / sizeof(kHoverDelayPresetsMs[0])); ++i) {
+            int ms = kHoverDelayPresetsMs[i];
+            wchar_t label[64];
+            if (ms == 0) wcscpy_s(label, L"立即");
+            else swprintf_s(label, L"%g 秒", ms / 1000.0);
+            AppendMenuW(hDelayMenu, MF_STRING | (g_hoverHideDelayMs == ms ? MF_CHECKED : MF_UNCHECKED), ID_HOVER_DELAY_FIRST + i, label);
+        }
+        AppendMenuW(hModeMenu, MF_POPUP | (on ? 0 : MF_GRAYED), (UINT_PTR)hDelayMenu, L"悬停多久后隐藏");
+    }
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"显示模式");
     AppendMenuW(hMenu, MF_STRING, ID_SETTINGS, L"外观设置…");
     std::wstring fontLabel = L"字体：" + (g_fontFamily.empty() ? std::wstring(L"默认") : g_fontFamily) + L"…";
@@ -2622,6 +2650,7 @@ void confWrite() {
     ofs << "DisplayMode: " << g_displayMode << std::endl;
     ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
     ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+    ofs << "HoverHideDelay: " << g_hoverHideDelayMs << std::endl;
     ofs << "SurfaceLead: " << g_surfaceLeadMin << std::endl;
     ofs << "SurfaceEvery: " << g_surfaceEveryMin << std::endl;
     ofs << "ShowHidden: " << (g_showHidden ? 1 : 0) << std::endl;
@@ -3658,6 +3687,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             confWrite();
             UpdateHoverHideTimer(hWnd);
         }
+        if (LOWORD(wParam) >= ID_HOVER_DELAY_FIRST &&
+            LOWORD(wParam) < ID_HOVER_DELAY_FIRST + (int)(sizeof(kHoverDelayPresetsMs) / sizeof(kHoverDelayPresetsMs[0]))) {
+            g_hoverHideDelayMs = kHoverDelayPresetsMs[LOWORD(wParam) - ID_HOVER_DELAY_FIRST];
+            g_hoverStartTick = 0;
+            confWrite();
+        }
         if (LOWORD(wParam) == ID_NEW_COUNTDOWN) {
             PromptNewCountdown(hWnd);
             RenderTip(hWnd);
@@ -4049,6 +4084,7 @@ void confCreate() {
         ofs << "DisplayMode: " << g_displayMode << std::endl;
         ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
         ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+        ofs << "HoverHideDelay: " << g_hoverHideDelayMs << std::endl;
         ofs << "SurfaceLead: " << g_surfaceLeadMin << std::endl;
         ofs << "SurfaceEvery: " << g_surfaceEveryMin << std::endl;
     ofs << "ShowHidden: " << (g_showHidden ? 1 : 0) << std::endl;
@@ -4123,6 +4159,9 @@ void readFromFile(int& x, int& y) {
         }
         else if (line.find("SurfaceEvery:") == 0) {
             try { g_surfaceEveryMin = (std::max)(0, std::stoi(line.substr(line.find(":") + 1))); } catch (...) {}
+        }
+        else if (line.find("HoverHideDelay:") == 0) {
+            try { g_hoverHideDelayMs = (std::max)(0, (std::min)(60000, std::stoi(line.substr(line.find(":") + 1)))); } catch (...) {}
         }
         else if (line.find("HoverHide:") == 0) {
             g_hoverHideEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);

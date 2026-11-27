@@ -153,7 +153,7 @@ Countdowns from older versions are converted to deadlines on startup; the old al
 |---|---|
 | **Smart surfacing** (recommended, default for new installs) | Lives on the desktop and never covers your windows. It rises only when something matters: when a deadline enters the lead time (default 10 min) until it is handled or fires, and — if anything is open — for an 8-second glance every so often (default 45 min). While surfaced the card is **translucent, never takes focus and lets clicks pass through**; hovering makes it fainter, and holding Ctrl (⌘ on macOS) makes it solid and interactive. It stays down while a full-screen app or presentation is in front (expiry alerts excepted). |
 | Attach to desktop | Always on the desktop layer, covered by normal windows; on Windows `Win+D` does not hide it. |
-| Always on top | Above all windows; optional "hide on hover" fades it and lets clicks through. |
+| Always on top | Above all windows; optional "hide on hover" fades it and lets clicks through once the mouse has hovered for a set delay (default 1 s; immediately / 0.5 / 1 / 2 / 3 / 5 s). |
 
 Lead time (5 / 10 / 15 / 30 min) and periodic glance (30 / 45 / 60 min / off) are in the display-mode submenu. Expiry alerts bring the card to the front in every mode.
 
@@ -184,6 +184,7 @@ The config file is `key: value` per line, written automatically; manual edits ta
 | `SurfaceLead` | Smart surfacing: minutes before a deadline to surface | `10` |
 | `SurfaceEvery` | Smart surfacing: glance interval in minutes, `0` off | `45` |
 | `HoverHide` | Hide on hover when always on top | `1` |
+| `HoverHideDelay` | How long the mouse must hover before hiding (ms), `0` = immediately | `1000` |
 | `ShowHidden` | Show `_HIDE` items faded | `0` |
 | `SinkCompleted` | Sink completed items to the end of their group | `0` |
 | `DueDisplay` | Deadline pill shows `0` remaining / `1` deadline | `0` |
