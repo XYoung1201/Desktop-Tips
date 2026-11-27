@@ -57,23 +57,30 @@ using namespace std::chrono;
 #define ID_SETTINGS 13
 #define ID_MODE_DESKTOP 14
 #define ID_MODE_TOPMOST 15
-#define ID_COUNTDOWN_1MIN 16
-#define ID_COUNTDOWN_5MIN 17
-#define ID_COUNTDOWN_10MIN 18
-#define ID_COUNTDOWN_CUSTOM 19
-#define ID_ALARM_CUSTOM 20
-#define ID_REMINDER_CANCEL 21
+#define ID_MODE_SMART 16
+#define ID_SURFACE_LEAD_FIRST 40   // 40..43：提前 5/10/15/30 分钟浮现
+#define ID_SURFACE_EVERY_FIRST 45  // 45..48：每 30/45/60 分钟轻浮现一次 / 关闭
 #define ID_FONT_SELECT 22
-#define ID_COUNTDOWN_1HOUR 23
-#define ID_COUNTDOWN_REPEAT 24
 #define ID_HOVER_HIDE 25
-// 单项任务计时（右键某条待办）
-#define ID_TASK_CD_FIRST 101      // 101..108 = 预设倒计时
-#define ID_TASK_CD_CUSTOM 110
+// 悬停隐藏延时预设（201..206）
+#define ID_HOVER_DELAY_FIRST 201
+#define ID_REMINDER_CANCEL 21
+#define ID_NEW_COUNTDOWN 30
+#define ID_SHOW_HIDDEN 31
+#define ID_SINK_DONE 32
+
+#define ID_TASK_CD_FIRST 101      // 101..108 = 快速倒计时（换算成截止时间）
+#define ID_TASK_DUE_SET 110       // 设置截止时间 / 剩余时长…
 #define ID_TASK_STOPWATCH 111
 #define ID_TASK_PAUSE 112
 #define ID_TASK_RESTART 113
-#define ID_TASK_REMOVE 114
+#define ID_TASK_REMOVE 114        // 移除正计时
+#define ID_TASK_DUE_CLEAR 115     // 清除截止时间
+#define ID_ITEM_HIDE 116          // 隐藏 / 取消隐藏（任务、倒计时、分组）
+#define ID_GROUP_FOLD 117         // 折叠 / 展开分组
+#define ID_CD_DELETE 118          // 删除独立倒计时
+#define ID_ITEM_SHOW 119          // 折叠 / 隐藏分组时仍显示该任务（_SHOW）
+#define ID_ITEM_LAST 119
 
 #define TIMER_REFRESH 1
 #define TIMER_REMINDER_CHECK 2
@@ -101,7 +108,7 @@ static std::wstring g_fontFamily = L"Microsoft YaHei UI";
 // 显示模式：
 //   0 = 附着桌面（默认）—— 贴在壁纸层(WorkerW)上，Win+D /“显示桌面”不会使其最小化，永远附着。
 //   1 = 始终置顶 —— 浮在所有窗口最上层，Win+D 也不影响，始终保持在最上层。
-static int g_displayMode = 0;
+static int g_displayMode = 2;   // 0 = 附着桌面，1 = 始终置顶，2 = 智能浮现（新安装默认）
 
 // 手动拖动状态：子窗口(WS_CHILD)模式下无法用 HTCAPTION 拖动，需自行处理
 static bool  g_dragging   = false;
@@ -112,32 +119,33 @@ static bool g_hasLastContextMenuPt = false;
 struct TodoHitRect {
     RECT rc;
     int sourceIndex;
-    std::wstring key;       // 任务文本（去掉 "- " 与 "_OK"），用作计时器的键
+    std::wstring key;       // 条目键：任务为去掉前缀与尾部标记的正文；倒计时/分组带内部前缀
     bool completed;
+    int kind = 0;           // 计时胶囊：0 = 正计时，1 = 截止时间
 };
 
 static std::vector<TodoHitRect> g_todoHitRects;   // 复选框
 static std::vector<TodoHitRect> g_rowHitRects;    // 整行（右键为该任务设置计时）
-static std::vector<TodoHitRect> g_pillHitRects;   // 计时胶囊（单击暂停/继续）
+static std::vector<TodoHitRect> g_pillHitRects;   // 计时胶囊（正计时：暂停/继续；截止时间：切换显示方式）
+static std::vector<TodoHitRect> g_groupHitRects;  // 分组标题（单击折叠/展开）
 
 struct BannerButton { RECT rc; int action; };
 enum { BANNER_DONE = 1, BANNER_SNOOZE = 2, BANNER_DISMISS = 3 };
 static std::vector<BannerButton> g_bannerButtons;
 
-static bool g_reminderArmed = false;
-static system_clock::time_point g_reminderDue;
-static std::wstring g_reminderTitle;
-static std::wstring g_reminderDetail;
-static bool g_reminderIsCountdown = false;
-static int g_reminderIntervalSeconds = 0;
-static bool g_countdownRepeatEnabled = false;
+static bool g_countdownRepeatEnabled = false;   // 新建独立倒计时时「重复」的默认值（配置键 CountdownRepeat）
+static bool g_showHidden = false;               // 临时显示带 _HIDE 的条目（淡显），配置键 ShowHidden
+static bool g_dueShowAbsolute = false;          // 截止时间胶囊显示「剩余时长」(false) 还是「截止时刻」(true)，配置键 DueDisplay
+static int  g_dueInputMode = 1;                 // 倒计时对话框默认页：0 = 截止时间，1 = 剩余时长，配置键 DueInputMode
+static bool g_sinkCompleted = false;            // 勾选完成后是否把已完成项沉到段末，配置键 SinkCompleted（默认不移动）
+static bool g_hasDuePill = false;               // 当前卡片上是否有截止时间胶囊（需要每秒刷新）
 
 static bool g_alertActive = false;
 static bool g_restoringAlert = false;
 static steady_clock::time_point g_alertStarted;
 static std::wstring g_alertTitle;
 static std::wstring g_alertDetail;
-static std::wstring g_alertTaskKey;          // 触发提醒的任务；空 = 全局倒计时/闹钟
+static std::wstring g_alertTaskKey;          // 触发提醒的条目键（任务或独立倒计时）
 static std::vector<std::wstring> g_systemFonts;
 
 // ---- 每项任务的计时器（倒计时 / 正计时）----
@@ -153,7 +161,8 @@ struct TaskTimer {
 };
 static std::vector<TaskTimer> g_taskTimers;
 static bool g_taskTimersLoaded = false;
-static std::wstring g_menuTaskKey;           // 右键菜单所针对的任务
+static std::wstring g_menuTaskKey;           // 右键菜单所针对的条目
+static int g_menuHint = -1;                  // 该条目所在行号（提示）
 
 // ---- 动画 ----
 // 完成动画：勾选后复选框弹出填充 → 对勾描绘 → 涟漪与光点 → 删除线划过，结束后才写回文件；
@@ -194,6 +203,29 @@ static int  g_hoverAlpha = 255;          // 卡片整体不透明度（用于淡
 static bool g_contextMenuOpen = false;   // 右键菜单弹出期间不隐藏
 static const int HOVER_HIDE_POLL_MS = 30;
 static const int HOVER_HIDE_FADE_STEP = 64;   // 每次 tick 的 alpha 变化量（约 120ms 完成淡入/淡出）
+// 智能浮现（显示模式 2）：
+//   平时附着桌面，不打扰；有事时才以“半透明 + 鼠标穿透”的轻浮层浮到最上面：
+//     · 某项截止时间进入提前量（SurfaceLead 分钟）→ 浮现直到处理或到点（到点后走原有的醒目提醒）；
+//     · 每隔 SurfaceEvery 分钟（有未完成事项时）轻浮现 8 秒，扫一眼即沉回桌面。
+//   浮现时不抢焦点、不挡点击；鼠标移上去会更淡，按住 Ctrl 才变实、可勾选/拖动。
+//   前台是全屏程序或演示模式时不浮现（到点提醒除外）。
+// 悬停多久后才隐藏（配置键 HoverHideDelay，单位毫秒）；隐藏后鼠标离开卡片即恢复显示
+static int g_hoverHideDelayMs = 1000;
+static ULONGLONG g_hoverStartTick = 0;        // 本次悬停开始的时间（0 = 未在计时）
+static const int kHoverDelayPresetsMs[] = { 0, 500, 1000, 2000, 3000, 5000 };
+static int  g_surfaceLeadMin = 10;      // 配置键 SurfaceLead
+static int  g_surfaceEveryMin = 45;     // 配置键 SurfaceEvery，0 = 关闭定时轻浮现
+static bool g_peekActive = false;       // 当前是否浮在最上层（轻浮层）
+static bool g_peekGlance = false;       // true = 定时轻浮现（会自动沉回）
+static long long g_peekUntil = 0;
+static long long g_lastGlance = 0;
+static long long g_nextOpenDue = 0;     // 最近一个未完成且尚未到点的截止时间（0 = 无）
+static bool g_hasOpenItems = false;
+static const int PEEK_ALPHA = 178;      // 轻浮层的整体不透明度
+static const int PEEK_HOVER_ALPHA = 46; // 鼠标停在轻浮层上时
+static const int PEEK_GLANCE_SEC = 8;
+static const int kSurfaceLeadOpts[] = { 5, 10, 15, 30 };
+static const int kSurfaceEveryOpts[] = { 30, 45, 60, 0 };
 
 #define MAX_LOADSTRING 100
 
@@ -213,6 +245,7 @@ void confWrite();
 
 void FindWorkerW();
 void ApplyDisplayMode(HWND hwnd, int mode);
+static void UpdatePeek(HWND hwnd);
 
 HWND g_hWorkerW = NULL;
 // 重新设置父窗口(SetParent)期间置 true：此时系统会先隐藏窗口再重挂父子关系，
@@ -399,22 +432,6 @@ static void TrimLineRight(std::wstring& text)
     }
 }
 
-static bool StripOkMarker(std::wstring& text)
-{
-    size_t end = text.size();
-    while (end > 0 && (text[end - 1] == L' ' || text[end - 1] == L'\t' || text[end - 1] == L'\r')) {
-        end--;
-    }
-    if (end < 3 || text.compare(end - 3, 3, L"_OK") != 0) return false;
-
-    size_t removeFrom = end - 3;
-    while (removeFrom > 0 && (text[removeFrom - 1] == L' ' || text[removeFrom - 1] == L'\t')) {
-        removeFrom--;
-    }
-    text.erase(removeFrom);
-    return true;
-}
-
 static std::vector<std::wstring> SplitLinesW(const std::wstring& text)
 {
     std::wstring normalized;
@@ -465,72 +482,379 @@ static bool WriteTodoFileLinesW(const std::vector<std::wstring>& lines)
     return true;
 }
 
-static bool ParseTodoLineState(const std::wstring& line, std::wstring* todoText, bool* completed)
-{
-    std::wstring s = line;
-    TrimLineRight(s);
+// ============================================================================
+//  TODO 行模型
+//  行首：# 大标题 / > 次要说明 / ## 分组（### 子分组，#### 再下一级…）/ ! 独立倒计时 /
+//        - 或 * 或直接文字 = 待办；单独一行 ## 结束所有分组，单独一行 ### 结束二级及更深的分组。
+//  行尾标记（顺序任意）：_OK 已完成、_HIDE 隐藏、_FOLD 折叠分组、_SHOW 分组折叠/隐藏时仍显示该条、
+//                        @YYYY-MM-DD HH:MM:SS 截止时间、/30m 到点后按间隔重复（s/m/h/d）。
+// ============================================================================
+static std::wstring TrimCopy(const std::wstring& text);
 
+enum LineKind { LK_BLANK, LK_HEADING, LK_META, LK_GROUP, LK_GROUP_END, LK_TODO, LK_COUNTDOWN };
+struct LineInfo {
+    LineKind kind = LK_BLANK;
+    std::wstring lead;      // 缩进 + 行首符号（原样保留）
+    std::wstring text;      // 正文（去掉行首符号与行尾标记）
+    bool ok = false, hide = false, fold = false, show = false;
+    int level = 0;          // 分组层级：## = 1，### = 2 …
+    bool hasDue = false;
+    long long due = 0;      // 截止时间（Unix 秒，本地时间解释）
+    long long repeat = 0;   // 重复间隔（秒）；0 = 不重复
+};
+
+static const wchar_t KEY_CD_PREFIX[] = { 0x01, L'C', 0 };   // 独立倒计时的键前缀
+static const wchar_t KEY_GROUP_PREFIX[] = { 0x01, L'G', 0 }; // 分组的键前缀
+
+static bool IsCountdownKey(const std::wstring& k) { return k.size() >= 2 && k[0] == 0x01 && k[1] == L'C'; }
+static bool IsGroupKey(const std::wstring& k) { return k.size() >= 2 && k[0] == 0x01 && k[1] == L'G'; }
+
+static int DaysInMonth(int y, int m)
+{
+    static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return (m >= 1 && m <= 12) ? d[m - 1] : 30;
+}
+
+static long long LocalEpoch(int y, int mo, int d, int h, int mi, int s)
+{
+    std::tm tmv{};
+    tmv.tm_year = y - 1900; tmv.tm_mon = mo - 1; tmv.tm_mday = d;
+    tmv.tm_hour = h; tmv.tm_min = mi; tmv.tm_sec = s; tmv.tm_isdst = -1;
+    return (long long)std::mktime(&tmv);
+}
+
+static std::tm LocalTm(long long epoch)
+{
+    std::time_t t = (std::time_t)epoch;
+    std::tm tmv{};
+    localtime_s(&tmv, &t);
+    return tmv;
+}
+
+// 「YYYY-MM-DD」「YYYY-MM-DD HH:MM」「YYYY-MM-DD HH:MM:SS」；日期分隔符可用 - / .，日期与时间之间可用空格或 T。
+// 只写日期时视为当天 23:59:59。
+static bool ParseDueText(const std::wstring& in, long long& out)
+{
+    std::wstring s = TrimCopy(in);
+    size_t i = 0;
+    auto num = [&](size_t minD, size_t maxD, int& v) -> bool {
+        size_t st = i; v = 0;
+        while (i < s.size() && i - st < maxD && s[i] >= L'0' && s[i] <= L'9') { v = v * 10 + (s[i] - L'0'); i++; }
+        return i - st >= minD;
+    };
+    auto dateSep = [&]() -> bool {
+        if (i < s.size() && (s[i] == L'-' || s[i] == L'/' || s[i] == L'.')) { i++; return true; }
+        return false;
+    };
+    auto timeSep = [&]() -> bool {
+        if (i < s.size() && (s[i] == L':' || s[i] == 0xFF1A)) { i++; return true; }
+        return false;
+    };
+    int y, mo, d, h = 23, mi = 59, sec = 59;
+    if (!num(4, 4, y) || !dateSep() || !num(1, 2, mo) || !dateSep() || !num(1, 2, d)) return false;
+    if (i < s.size()) {
+        if (s[i] != L' ' && s[i] != L'T' && s[i] != L'\t') return false;
+        while (i < s.size() && (s[i] == L' ' || s[i] == L'T' || s[i] == L'\t')) i++;
+        if (!num(1, 2, h) || !timeSep() || !num(2, 2, mi)) return false;
+        sec = 0;
+        if (i < s.size()) {
+            if (!timeSep() || !num(2, 2, sec)) return false;
+        }
+        if (i != s.size()) return false;
+    }
+    if (y < 1971 || y > 2999 || mo < 1 || mo > 12 || d < 1 || d > DaysInMonth(y, mo) || h > 23 || mi > 59 || sec > 59) return false;
+    long long e = LocalEpoch(y, mo, d, h, mi, sec);
+    if (e <= 0) return false;
+    out = e;
+    return true;
+}
+
+static std::wstring FormatDueText(long long due)
+{
+    std::tm t = LocalTm(due);
+    wchar_t buf[40];
+    swprintf(buf, 40, L"%04d-%02d-%02d %02d:%02d:%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    return buf;
+}
+
+static std::wstring FormatRepeatText(long long rep)
+{
+    wchar_t buf[32];
+    if (rep % 86400 == 0) swprintf(buf, 32, L"%lldd", rep / 86400);
+    else if (rep % 3600 == 0) swprintf(buf, 32, L"%lldh", rep / 3600);
+    else if (rep % 60 == 0) swprintf(buf, 32, L"%lldm", rep / 60);
+    else swprintf(buf, 32, L"%llds", rep);
+    return buf;
+}
+
+static bool StripSuffixToken(std::wstring& s, const wchar_t* tok)
+{
+    TrimLineRight(s);
+    size_t n = wcslen(tok);
+    if (s.size() < n || s.compare(s.size() - n, n, tok) != 0) return false;
+    s.erase(s.size() - n);
+    TrimLineRight(s);
+    return true;
+}
+
+// 行尾「@日期 [时间]」；@ 前须为空白或位于正文开头（避免把邮箱等误认成截止时间）
+static bool StripDueSuffix(std::wstring& s, long long& due)
+{
+    TrimLineRight(s);
+    size_t at = s.rfind(L'@');
+    if (at == std::wstring::npos) return false;
+    if (at > 0 && s[at - 1] != L' ' && s[at - 1] != L'\t') return false;
+    long long d = 0;
+    if (!ParseDueText(s.substr(at + 1), d)) return false;
+    due = d;
+    s.erase(at);
+    TrimLineRight(s);
+    return true;
+}
+
+// 行尾「/30m」之类的重复间隔
+static bool StripRepeatSuffix(std::wstring& s, long long& rep)
+{
+    TrimLineRight(s);
+    size_t sp = s.find_last_of(L" \t");
+    std::wstring tok = (sp == std::wstring::npos) ? s : s.substr(sp + 1);
+    if (tok.size() < 3 || tok[0] != L'/') return false;
+    wchar_t u = tok.back();
+    long long mul = (u == L's') ? 1 : (u == L'm') ? 60 : (u == L'h') ? 3600 : (u == L'd') ? 86400 : 0;
+    if (!mul) return false;
+    long long n = 0;
+    for (size_t k = 1; k + 1 < tok.size(); ++k) {
+        if (tok[k] < L'0' || tok[k] > L'9') return false;
+        n = n * 10 + (tok[k] - L'0');
+        if (n > 1000000) return false;
+    }
+    if (n <= 0) return false;
+    rep = n * mul;
+    s.erase(sp == std::wstring::npos ? 0 : sp);
+    TrimLineRight(s);
+    return true;
+}
+
+static void StripItemFlags(std::wstring& body, LineInfo& L, bool allowOk, bool allowDue, bool allowFold)
+{
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        if (allowOk && StripSuffixToken(body, L"_OK")) { L.ok = true; changed = true; continue; }
+        if (StripSuffixToken(body, L"_HIDE")) { L.hide = true; changed = true; continue; }
+        if (allowOk && StripSuffixToken(body, L"_SHOW")) { L.show = true; changed = true; continue; }
+        if (allowFold && StripSuffixToken(body, L"_FOLD")) { L.fold = true; changed = true; continue; }
+        if (allowDue && !L.hasDue) {
+            std::wstring tmp = body;
+            long long rep = 0, due = 0;
+            bool hasRep = StripRepeatSuffix(tmp, rep);
+            if (StripDueSuffix(tmp, due)) {
+                L.hasDue = true; L.due = due; L.repeat = hasRep ? rep : 0;
+                body = tmp;
+                changed = true;
+                continue;
+            }
+        }
+    }
+}
+
+static LineInfo ParseLine(const std::wstring& raw)
+{
+    LineInfo L;
+    std::wstring s = raw;
+    TrimLineRight(s);
     size_t b = 0;
     while (b < s.size() && (s[b] == L' ' || s[b] == L'\t')) b++;
+    std::wstring indent = s.substr(0, b);
     std::wstring t = s.substr(b);
-    if (t.empty() || t[0] == L'#' || t[0] == L'>') return false;
+    if (t.empty()) return L;
 
-    std::wstring text;
-    if ((t[0] == L'-' || t[0] == L'*') && t.size() > 1 && t[1] == L' ') {
-        text = t.substr(2);
-    } else {
-        text = t;
+    if (t.size() >= 2 && t[0] == L'#' && t[1] == L'#') {
+        size_t hashes = 0;
+        while (hashes < t.size() && t[hashes] == L'#') hashes++;
+        std::wstring body = TrimCopy(t.substr(hashes));
+        L.level = (int)hashes - 1;
+        L.lead = indent + std::wstring(hashes, L'#') + L" ";
+        if (body.empty()) { L.kind = LK_GROUP_END; return L; }
+        L.kind = LK_GROUP;
+        StripItemFlags(body, L, false, false, true);
+        L.text = TrimCopy(body);
+        return L;
     }
+    if (t[0] == L'#' || t[0] == L'>') {
+        L.kind = (t[0] == L'#') ? LK_HEADING : LK_META;
+        size_t n = (t.size() > 1 && t[1] == L' ') ? 2 : 1;
+        L.lead = indent + t.substr(0, n);
+        std::wstring body = t.substr(n);
+        StripItemFlags(body, L, false, false, false);
+        L.text = body;
+        return L;
+    }
+    if (t[0] == L'!') {
+        LineInfo C;
+        std::wstring body = TrimCopy(t.substr(1));
+        StripItemFlags(body, C, true, true, false);
+        if (C.hasDue) {
+            C.kind = LK_COUNTDOWN;
+            C.lead = indent + L"! ";
+            C.text = TrimCopy(body);
+            return C;
+        }
+        // 没有截止时间的 ! 行仍按普通待办处理（兼容旧文件）
+    }
+    L.kind = LK_TODO;
+    std::wstring body;
+    if ((t[0] == L'-' || t[0] == L'*') && t.size() > 1 && t[1] == L' ') {
+        L.lead = indent + t.substr(0, 2);
+        body = t.substr(2);
+    } else {
+        L.lead = indent;
+        body = t;
+    }
+    StripItemFlags(body, L, true, true, false);
+    L.text = body;
+    return L;
+}
 
-    bool isCompleted = StripOkMarker(text);
-    if (todoText) *todoText = text;
-    if (completed) *completed = isCompleted;
+static std::wstring FormatLine(const LineInfo& L)
+{
+    std::wstring s = L.lead + L.text;
+    switch (L.kind) {
+    case LK_BLANK: return L"";
+    case LK_GROUP_END: return std::wstring((size_t)(L.level > 0 ? L.level + 1 : 2), L'#');
+    case LK_HEADING:
+    case LK_META:
+        if (L.hide) s += L" _HIDE";
+        return s;
+    case LK_GROUP:
+        if (L.hide) s += L" _HIDE";
+        if (L.fold) s += L" _FOLD";
+        return s;
+    default: break;
+    }
+    bool marker = false;
+    if (L.hasDue) { s += L" @" + FormatDueText(L.due); marker = true; }
+    if (L.hasDue && L.repeat > 0) s += L" /" + FormatRepeatText(L.repeat);
+    if (L.hide) { s += L" _HIDE"; marker = true; }
+    if (L.show) { s += L" _SHOW"; marker = true; }
+    if (L.ok) s += marker ? L" _OK" : L"_OK";
+    return s;
+}
+
+// 条目键：任务 = 正文；独立倒计时 / 分组带内部前缀，避免与任务重名冲突
+static std::wstring ItemKey(const LineInfo& L)
+{
+    switch (L.kind) {
+    case LK_TODO: return TrimCopy(L.text);
+    case LK_COUNTDOWN: return KEY_CD_PREFIX + TrimCopy(L.text);
+    case LK_GROUP: return KEY_GROUP_PREFIX + TrimCopy(L.text);
+    default: return L"";
+    }
+}
+
+static std::wstring KeyDisplayName(const std::wstring& key)
+{
+    if (IsCountdownKey(key) || IsGroupKey(key)) return key.substr(2);
+    return key;
+}
+
+static bool ParseTodoLineState(const std::wstring& line, std::wstring* todoText, bool* completed)
+{
+    LineInfo L = ParseLine(line);
+    if (L.kind != LK_TODO) return false;
+    if (todoText) *todoText = L.text;
+    if (completed) *completed = L.ok;
     return true;
 }
 
 static bool IsTodoLine(const std::wstring& line)
 {
-    return ParseTodoLineState(line, nullptr, nullptr);
+    return ParseLine(line).kind == LK_TODO;
 }
 
+// 只在同一段内（分组标题 / 分组结束 / # 大标题 都会开启新段）把已完成的待办排到未完成之后
 static void SortTodoLinesByCompletion(std::vector<std::wstring>& lines)
 {
     std::vector<size_t> slots;
-    std::vector<std::wstring> openLines;
-    std::vector<std::wstring> doneLines;
-
+    std::vector<std::wstring> openLines, doneLines;
+    auto flush = [&]() {
+        size_t n = 0;
+        for (const auto& l : openLines) lines[slots[n++]] = l;
+        for (const auto& l : doneLines) lines[slots[n++]] = l;
+        slots.clear(); openLines.clear(); doneLines.clear();
+    };
     for (size_t i = 0; i < lines.size(); ++i) {
-        bool completed = false;
-        if (!ParseTodoLineState(lines[i], nullptr, &completed)) continue;
+        LineInfo L = ParseLine(lines[i]);
+        if (L.kind == LK_GROUP || L.kind == LK_GROUP_END || L.kind == LK_HEADING) { flush(); continue; }
+        if (L.kind != LK_TODO) continue;
         slots.push_back(i);
-        if (completed) doneLines.push_back(lines[i]);
-        else openLines.push_back(lines[i]);
+        (L.ok ? doneLines : openLines).push_back(lines[i]);
     }
+    flush();
+}
 
-    size_t n = 0;
-    for (const auto& line : openLines) lines[slots[n++]] = line;
-    for (const auto& line : doneLines) lines[slots[n++]] = line;
+// 按键找到条目所在行；hint 为行号提示（文件期间被改过也能找到）
+static int FindItemLine(const std::vector<std::wstring>& lines, int hint, const std::wstring& key)
+{
+    if (key.empty()) return -1;
+    if (hint >= 0 && (size_t)hint < lines.size() && ItemKey(ParseLine(lines[(size_t)hint])) == key) return hint;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (ItemKey(ParseLine(lines[i])) == key) return (int)i;
+    }
+    return -1;
 }
 
 static bool ToggleTodoLineCompletion(int sourceIndex)
 {
     if (sourceIndex < 0) return false;
-
     std::vector<std::wstring> lines;
     if (!ReadTodoFileLinesW(lines)) return false;
-    if ((size_t)sourceIndex >= lines.size() || !IsTodoLine(lines[(size_t)sourceIndex])) return false;
+    if ((size_t)sourceIndex >= lines.size()) return false;
+    LineInfo L = ParseLine(lines[(size_t)sourceIndex]);
+    if (L.kind != LK_TODO) return false;
+    L.ok = !L.ok;
+    lines[(size_t)sourceIndex] = FormatLine(L);
+    if (g_sinkCompleted) SortTodoLinesByCompletion(lines);   // 默认不移动：已完成项留在原位
+    return WriteTodoFileLinesW(lines);
+}
 
-    bool completed = false;
-    ParseTodoLineState(lines[(size_t)sourceIndex], nullptr, &completed);
-    if (completed) {
-        StripOkMarker(lines[(size_t)sourceIndex]);
-    } else {
-        TrimLineRight(lines[(size_t)sourceIndex]);
-        StripOkMarker(lines[(size_t)sourceIndex]);
-        lines[(size_t)sourceIndex] += L"_OK";
+// 修改某个条目所在的行（找不到返回 false）。fn 返回 false 表示删除该行。
+static bool EditItemLine(int hint, const std::wstring& key, const std::function<bool(LineInfo&)>& fn)
+{
+    std::vector<std::wstring> lines;
+    if (!ReadTodoFileLinesW(lines)) return false;
+    int idx = FindItemLine(lines, hint, key);
+    if (idx < 0) return false;
+    LineInfo L = ParseLine(lines[(size_t)idx]);
+    if (fn(L)) lines[(size_t)idx] = FormatLine(L);
+    else lines.erase(lines.begin() + idx);
+    return WriteTodoFileLinesW(lines);
+}
+
+// 新建独立倒计时：放在已有倒计时之后；没有的话放在第一条待办 / 分组之前；都没有就追加到末尾
+static bool InsertCountdownLine(const std::wstring& name, long long due, long long repeat)
+{
+    std::vector<std::wstring> lines;
+    if (!ReadTodoFileLinesW(lines)) return false;
+    LineInfo C;
+    C.kind = LK_COUNTDOWN; C.lead = L"! "; C.text = name;
+    C.hasDue = true; C.due = due; C.repeat = repeat;
+    int lastCd = -1, firstList = -1;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        LineInfo L = ParseLine(lines[i]);
+        if (L.kind == LK_GROUP) { if (firstList < 0) firstList = (int)i; break; }
+        if (L.kind == LK_COUNTDOWN) lastCd = (int)i;
+        if (L.kind == LK_TODO && firstList < 0) firstList = (int)i;
     }
-
-    SortTodoLinesByCompletion(lines);
+    size_t pos;
+    if (lastCd >= 0) pos = (size_t)lastCd + 1;
+    else if (firstList >= 0) pos = (size_t)firstList;
+    else {
+        pos = lines.size();
+        while (pos > 0 && TrimCopy(lines[pos - 1]).empty()) pos--;
+    }
+    lines.insert(lines.begin() + pos, FormatLine(C));
     return WriteTodoFileLinesW(lines);
 }
 
@@ -627,211 +951,9 @@ static std::vector<std::wstring> SplitWide(const std::wstring& text, wchar_t sep
     return parts;
 }
 
-static std::wstring FormatDuration(int totalSeconds)
-{
-    if (totalSeconds < 0) totalSeconds = 0;
-    int hours = totalSeconds / 3600;
-    int minutes = (totalSeconds % 3600) / 60;
-    int seconds = totalSeconds % 60;
-    wchar_t buf[64];
-    if (hours > 0) {
-        swprintf(buf, 64, L"%d小时%02d分%02d秒", hours, minutes, seconds);
-    } else if (minutes > 0) {
-        swprintf(buf, 64, L"%d分%02d秒", minutes, seconds);
-    } else {
-        swprintf(buf, 64, L"%d秒", seconds);
-    }
-    return buf;
-}
-
-static std::wstring FormatTimePoint(system_clock::time_point tp)
-{
-    std::time_t t = system_clock::to_time_t(tp);
-    std::tm tmv{};
-    localtime_s(&tmv, &t);
-    wchar_t buf[64];
-    swprintf(buf, 64, L"%04d-%02d-%02d %02d:%02d:%02d",
-        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-        tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-    return buf;
-}
-
-static bool TryParseCountdownSeconds(const std::wstring& input, int& seconds)
-{
-    std::wstring s = TrimCopy(input);
-    for (wchar_t& ch : s) {
-        if (ch == L'：') ch = L':';
-    }
-    if (s.empty()) return false;
-
-    std::vector<std::wstring> parts = SplitWide(s, L':');
-    int total = 0;
-    if (parts.size() == 1) {
-        int minutes = 0;
-        if (!TryParseUnsigned(parts[0], minutes) || minutes <= 0) return false;
-        total = minutes * 60;
-    } else if (parts.size() == 2 || parts.size() == 3) {
-        int vals[3] = { 0, 0, 0 };
-        int offset = (parts.size() == 2) ? 1 : 0;
-        for (size_t i = 0; i < parts.size(); ++i) {
-            if (!TryParseUnsigned(parts[i], vals[offset + i])) return false;
-        }
-        if (vals[1] > 59 || vals[2] > 59) return false;
-        total = vals[0] * 3600 + vals[1] * 60 + vals[2];
-        if (total <= 0) return false;
-    } else {
-        return false;
-    }
-    seconds = total;
-    return true;
-}
-
-static bool TryParseAlarmTime(const std::wstring& input, system_clock::time_point& due)
-{
-    std::wstring s = TrimCopy(input);
-    for (wchar_t& ch : s) {
-        if (ch == L'：') ch = L':';
-    }
-    std::vector<std::wstring> parts = SplitWide(s, L':');
-    if (parts.size() != 2 && parts.size() != 3) return false;
-
-    int hour = 0, minute = 0, second = 0;
-    if (!TryParseUnsigned(parts[0], hour) ||
-        !TryParseUnsigned(parts[1], minute) ||
-        (parts.size() == 3 && !TryParseUnsigned(parts[2], second))) {
-        return false;
-    }
-    if (hour > 23 || minute > 59 || second > 59) return false;
-
-    std::time_t nowTime = std::time(nullptr);
-    std::tm tmv{};
-    localtime_s(&tmv, &nowTime);
-    tmv.tm_hour = hour;
-    tmv.tm_min = minute;
-    tmv.tm_sec = second;
-    std::time_t dueTime = std::mktime(&tmv);
-    if (dueTime <= nowTime) dueTime += 24 * 60 * 60;
-    due = system_clock::from_time_t(dueTime);
-    return true;
-}
-
-#define IDC_PROMPT_EDIT 3201
-#define IDC_PROMPT_OK 3202
-#define IDC_PROMPT_CANCEL 3203
-
-struct TextPromptState {
-    std::wstring label;
-    std::wstring initial;
-    std::wstring output;
-    bool accepted = false;
-};
-
-static LRESULT CALLBACK TextPromptProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    TextPromptState* state = (TextPromptState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    switch (msg) {
-    case WM_CREATE: {
-        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
-        state = (TextPromptState*)cs->lpCreateParams;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)state);
-        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        HWND label = CreateWindowExW(0, L"STATIC", state->label.c_str(),
-            WS_CHILD | WS_VISIBLE,
-            18, 16, 300, 24, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->initial.c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            18, 46, 300, 26, hwnd, (HMENU)(INT_PTR)IDC_PROMPT_EDIT, GetModuleHandle(NULL), NULL);
-        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            150, 88, 78, 28, hwnd, (HMENU)(INT_PTR)IDC_PROMPT_OK, GetModuleHandle(NULL), NULL);
-        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            240, 88, 78, 28, hwnd, (HMENU)(INT_PTR)IDC_PROMPT_CANCEL, GetModuleHandle(NULL), NULL);
-        SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
-        SendMessageW(edit, WM_SETFONT, (WPARAM)font, TRUE);
-        SendMessageW(ok, WM_SETFONT, (WPARAM)font, TRUE);
-        SendMessageW(cancel, WM_SETFONT, (WPARAM)font, TRUE);
-        SetFocus(edit);
-        SendMessageW(edit, EM_SETSEL, 0, -1);
-        return 0;
-    }
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_PROMPT_OK || LOWORD(wParam) == IDOK) {
-            wchar_t buf[256] = { 0 };
-            GetDlgItemTextW(hwnd, IDC_PROMPT_EDIT, buf, 256);
-            state->output = buf;
-            state->accepted = true;
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        if (LOWORD(wParam) == IDC_PROMPT_CANCEL || LOWORD(wParam) == IDCANCEL) {
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        break;
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
-
-static bool ShowTextPrompt(HWND owner, const wchar_t* title, const wchar_t* label,
-    const std::wstring& initial, std::wstring& output)
-{
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSW wc = { 0 };
-        wc.lpfnWndProc = TextPromptProc;
-        wc.hInstance = GetModuleHandle(NULL);
-        wc.lpszClassName = L"DesktopTipTextPrompt";
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        RegisterClassW(&wc);
-        registered = true;
-    }
-
-    TextPromptState state;
-    state.label = label;
-    state.initial = initial;
-
-    RECT wa;
-    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
-    int w = 340, h = 160;
-    int x = wa.left + ((wa.right - wa.left) - w) / 2;
-    int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
-
-    HWND dlg = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        L"DesktopTipTextPrompt", title,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        x, y, w, h, owner, NULL, GetModuleHandle(NULL), &state);
-    if (!dlg) return false;
-
-    if (owner) EnableWindow(owner, FALSE);
-    MSG msg;
-    BOOL gm = TRUE;
-    while (IsWindow(dlg) && (gm = GetMessageW(&msg, NULL, 0, 0)) > 0) {
-        if (!IsDialogMessageW(dlg, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    if (owner) {
-        EnableWindow(owner, TRUE);
-        SetForegroundWindow(owner);
-    }
-    if (gm == 0) PostQuitMessage((int)msg.wParam);
-
-    if (state.accepted) {
-        output = state.output;
-        return true;
-    }
-    return false;
-}
-
 static bool HoverHideActive()
 {
-    return g_hoverHideEnabled && g_displayMode == 1 && !g_alertActive && !g_restoringAlert;
+    return ((g_hoverHideEnabled && g_displayMode == 1) || g_peekActive) && !g_alertActive && !g_restoringAlert;
 }
 
 static void SetClickThrough(HWND hwnd, bool on)
@@ -852,6 +974,7 @@ static void ResetHoverHide(HWND hwnd)
 {
     KillTimer(hwnd, TIMER_HOVER_HIDE);
     g_hoverHidden = false;
+    g_hoverStartTick = 0;
     SetClickThrough(hwnd, false);
     if (g_hoverAlpha != 255) {
         g_hoverAlpha = 255;
@@ -875,14 +998,31 @@ static void TickHoverHide(HWND hwnd)
     bool inside = PtInRect(&wr, pt) != FALSE;
     bool reveal = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;   // 按住 Ctrl：显示并可操作
     bool busy = g_dragging || g_contextMenuOpen || GetCapture() == hwnd;
-    bool wantHidden = inside && !reveal && !busy;
+    bool wantHidden;   // true = 鼠标穿透
+    int target;
+    if (g_peekActive) {   // 轻浮层：默认半透明且穿透；悬停更淡；按住 Ctrl 才变实可操作
+        bool interactive = reveal || busy;
+        wantHidden = !interactive;
+        target = interactive ? 255 : (inside ? PEEK_HOVER_ALPHA : PEEK_ALPHA);
+    } else {
+        wantHidden = inside && !reveal && !busy;
+        // 悬停延时：需连续悬停满 g_hoverHideDelayMs 才隐藏；已隐藏时只要鼠标仍在卡片内就保持隐藏
+        if (wantHidden && !g_hoverHidden) {
+            ULONGLONG nowTick = GetTickCount64();
+            if (g_hoverStartTick == 0) g_hoverStartTick = nowTick;
+            if (nowTick - g_hoverStartTick < (ULONGLONG)g_hoverHideDelayMs) wantHidden = false;
+        }
+        else if (!wantHidden) {
+            g_hoverStartTick = 0;
+        }
+        target = wantHidden ? 0 : 255;
+    }
 
     if (wantHidden != g_hoverHidden) {
         g_hoverHidden = wantHidden;
         SetClickThrough(hwnd, wantHidden);
     }
 
-    int target = wantHidden ? 0 : 255;
     if (g_hoverAlpha != target) {
         if (target > g_hoverAlpha) g_hoverAlpha = (std::min)(target, g_hoverAlpha + HOVER_HIDE_FADE_STEP);
         else                       g_hoverAlpha = (std::max)(target, g_hoverAlpha - HOVER_HIDE_FADE_STEP);
@@ -891,10 +1031,14 @@ static void TickHoverHide(HWND hwnd)
 }
 
 // ============================================================================
-//  每项任务的计时器（倒计时 / 正计时）
+//  正计时（每项任务的秒表）
+//  保存在 C:\ProgramData\DesktopTip\timers，每行：kind\tduration\tstart\taccum\tfired\t任务文本
+//  kind: up = 正计时；start 为本次开始计时的 Unix 秒（0 = 暂停中）；accum 为此前累计秒数。
+//  旧版本的 down（倒计时）记录会在启动时换算成截止时间写进 TODO 文件（见 MigrateLegacyCountdowns）。
 // ============================================================================
 static const char* TIMERS_DIR = "C:\\ProgramData\\DesktopTip";
 static const char* TIMERS_PATH = "C:\\ProgramData\\DesktopTip\\timers";
+static const char* DUES_PATH = "C:\\ProgramData\\DesktopTip\\deadlines";
 static const int kTaskPresetMinutes[] = { 5, 10, 15, 25, 30, 45, 60, 90 };
 static const int kTaskPresetCount = (int)(sizeof(kTaskPresetMinutes) / sizeof(kTaskPresetMinutes[0]));
 
@@ -906,6 +1050,52 @@ static long long TimerElapsed(const TaskTimer& t)
     return e < 0 ? 0 : e;
 }
 
+static void SaveTaskTimers()
+{
+    std::error_code ec;
+    fs::create_directories(TIMERS_DIR, ec);
+    std::ofstream f(TIMERS_PATH, std::ios::binary | std::ios::trunc);
+    if (!f.is_open()) return;
+    for (const auto& t : g_taskTimers) {
+        std::ostringstream o;
+        o << (t.countdown ? "down" : "up") << '\t' << t.duration << '\t' << t.start << '\t'
+          << t.accum << '\t' << (t.fired ? 1 : 0) << '\t' << WideToUtf8(t.key) << '\n';
+        f << o.str();
+    }
+}
+
+static void NoteDueSet(const std::wstring& key, long long due);
+
+// 旧版的任务倒计时（timers 文件里的 down 记录）→ 换算成截止时间写进 TODO 文件
+static void MigrateLegacyCountdowns()
+{
+    bool any = false;
+    for (const auto& t : g_taskTimers) if (t.countdown) { any = true; break; }
+    if (!any) return;
+    std::vector<std::wstring> lines;
+    if (!ReadTodoFileLinesW(lines)) return;   // TODO 文件暂时读不到：下次再迁移
+    long long now = NowEpoch();
+    bool fileChanged = false;
+    for (const auto& t : g_taskTimers) {
+        if (!t.countdown || t.fired) continue;
+        int idx = FindItemLine(lines, -1, t.key);
+        if (idx < 0) continue;
+        LineInfo L = ParseLine(lines[(size_t)idx]);
+        if (L.kind != LK_TODO || L.hasDue || L.ok) continue;
+        long long rem = t.duration - TimerElapsed(t);
+        L.hasDue = true;
+        L.due = now + (rem > 0 ? rem : 0);
+        L.repeat = 0;
+        lines[(size_t)idx] = FormatLine(L);
+        fileChanged = true;
+        NoteDueSet(t.key, L.due);
+    }
+    if (fileChanged && !WriteTodoFileLinesW(lines)) return;
+    g_taskTimers.erase(std::remove_if(g_taskTimers.begin(), g_taskTimers.end(),
+        [](const TaskTimer& t) { return t.countdown; }), g_taskTimers.end());
+    SaveTaskTimers();
+}
+
 static void LoadTaskTimers()
 {
     g_taskTimersLoaded = true;
@@ -913,6 +1103,7 @@ static void LoadTaskTimers()
     std::ifstream f(TIMERS_PATH, std::ios::binary);
     if (!f.is_open()) return;
     std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
     for (const auto& line : SplitLinesW(DecodeAutoToUtf16(bytes))) {
         std::vector<std::wstring> p = SplitWide(line, L'\t');
         if (p.size() < 6) continue;
@@ -930,27 +1121,15 @@ static void LoadTaskTimers()
         t.key = key;
         g_taskTimers.push_back(t);
     }
+    MigrateLegacyCountdowns();
 }
 
-static void SaveTaskTimers()
-{
-    std::error_code ec;
-    fs::create_directories(TIMERS_DIR, ec);
-    std::ofstream f(TIMERS_PATH, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) return;
-    for (const auto& t : g_taskTimers) {
-        std::ostringstream o;
-        o << (t.countdown ? "down" : "up") << '\t' << t.duration << '\t' << t.start << '\t'
-          << t.accum << '\t' << (t.fired ? 1 : 0) << '\t' << WideToUtf8(t.key) << '\n';
-        f << o.str();
-    }
-}
-
+// 只返回正计时（旧版倒计时记录在迁移前一律忽略）
 static TaskTimer* FindTaskTimer(const std::wstring& key)
 {
     if (!g_taskTimersLoaded) LoadTaskTimers();
     for (auto& t : g_taskTimers) {
-        if (t.key == key) return &t;
+        if (t.key == key && !t.countdown) return &t;
     }
     return nullptr;
 }
@@ -960,6 +1139,7 @@ static TaskTimer& EnsureTaskTimer(const std::wstring& key)
     if (TaskTimer* t = FindTaskTimer(key)) return *t;
     TaskTimer t;
     t.key = key;
+    t.countdown = false;
     g_taskTimers.push_back(t);
     return g_taskTimers.back();
 }
@@ -968,20 +1148,9 @@ static bool AnyTaskTimerRunning()
 {
     if (!g_taskTimersLoaded) LoadTaskTimers();
     for (const auto& t : g_taskTimers) {
-        if (t.start > 0) return true;
+        if (t.start > 0 && !t.countdown) return true;
     }
     return false;
-}
-
-static void StartTaskCountdown(const std::wstring& key, long long seconds)
-{
-    TaskTimer& t = EnsureTaskTimer(key);
-    t.countdown = true;
-    t.duration = seconds;
-    t.accum = 0;
-    t.start = NowEpoch();
-    t.fired = false;
-    SaveTaskTimers();
 }
 
 static void StartTaskStopwatch(const std::wstring& key)
@@ -1030,17 +1199,131 @@ static void RemoveTaskTimer(const std::wstring& key)
     SaveTaskTimers();
 }
 
-// 「再等 N 分钟」：把倒计时延长到“从现在起还剩 N 秒”，并继续计时
-static void SnoozeTaskTimer(const std::wstring& key, long long seconds)
+// ============================================================================
+//  截止时间的运行状态（不写进 TODO 文件的部分）
+//  C:\ProgramData\DesktopTip\deadlines，每行：due\tsetAt\tfired\t条目键
+//  setAt = 设定（或第一次看到）该截止时间的时刻，用于画进度环；fired = 是否已提醒过。
+// ============================================================================
+struct DueMeta {
+    long long due = 0;
+    long long setAt = 0;
+    bool fired = false;
+    bool seen = false;
+    std::wstring key;
+};
+static std::vector<DueMeta> g_dueMeta;
+static bool g_dueMetaLoaded = false;
+
+static std::wstring KeyForFile(const std::wstring& key)
 {
-    TaskTimer* t = FindTaskTimer(key);
-    if (!t) return;
-    long long el = TimerElapsed(*t);
-    t->countdown = true;
-    t->duration = el + seconds;
-    if (t->start == 0) t->start = NowEpoch();
-    t->fired = false;
-    SaveTaskTimers();
+    // 内部前缀 0x01 不便写入文本文件：独立倒计时写成 "!C:"、分组写成 "!G:"
+    if (IsCountdownKey(key)) return L"!C:" + key.substr(2);
+    if (IsGroupKey(key)) return L"!G:" + key.substr(2);
+    return L"T:" + key;
+}
+
+static std::wstring KeyFromFile(const std::wstring& s)
+{
+    if (s.compare(0, 3, L"!C:") == 0) return KEY_CD_PREFIX + s.substr(3);
+    if (s.compare(0, 3, L"!G:") == 0) return KEY_GROUP_PREFIX + s.substr(3);
+    if (s.compare(0, 2, L"T:") == 0) return s.substr(2);
+    return s;
+}
+
+static void LoadDueMeta()
+{
+    g_dueMetaLoaded = true;
+    g_dueMeta.clear();
+    std::ifstream f(DUES_PATH, std::ios::binary);
+    if (!f.is_open()) return;
+    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (const auto& line : SplitLinesW(DecodeAutoToUtf16(bytes))) {
+        std::vector<std::wstring> p = SplitWide(line, L'\t');
+        if (p.size() < 4) continue;
+        DueMeta m;
+        try {
+            m.due = std::stoll(p[0]);
+            m.setAt = std::stoll(p[1]);
+        } catch (...) { continue; }
+        m.fired = (p[2] == L"1");
+        std::wstring k = p[3];
+        for (size_t i = 4; i < p.size(); ++i) k += L"\t" + p[i];
+        m.key = KeyFromFile(k);
+        g_dueMeta.push_back(m);
+    }
+}
+
+static void SaveDueMeta()
+{
+    std::error_code ec;
+    fs::create_directories(TIMERS_DIR, ec);
+    std::ofstream f(DUES_PATH, std::ios::binary | std::ios::trunc);
+    if (!f.is_open()) return;
+    for (const auto& m : g_dueMeta) {
+        std::ostringstream o;
+        o << m.due << '\t' << m.setAt << '\t' << (m.fired ? 1 : 0) << '\t' << WideToUtf8(KeyForFile(m.key)) << '\n';
+        f << o.str();
+    }
+}
+
+static int FindDueMeta(const std::wstring& key, long long due)
+{
+    if (!g_dueMetaLoaded) LoadDueMeta();
+    for (size_t i = 0; i < g_dueMeta.size(); ++i) {
+        if (g_dueMeta[i].due == due && g_dueMeta[i].key == key) return (int)i;
+    }
+    return -1;
+}
+
+// 通过界面设定 / 修改截止时间后调用：进度环从现在开始走，且可以再次提醒
+static void NoteDueSet(const std::wstring& key, long long due)
+{
+    int i = FindDueMeta(key, due);
+    if (i < 0) {
+        DueMeta m;
+        m.key = key; m.due = due;
+        g_dueMeta.push_back(m);
+        i = (int)g_dueMeta.size() - 1;
+    }
+    g_dueMeta[(size_t)i].setAt = NowEpoch();
+    g_dueMeta[(size_t)i].fired = false;
+    SaveDueMeta();
+}
+
+static long long DueSetAt(const std::wstring& key, long long due)
+{
+    int i = FindDueMeta(key, due);
+    return i >= 0 ? g_dueMeta[(size_t)i].setAt : 0;
+}
+
+// 在 base 上加 months 个自然月（月末自动收拢，如 1-31 + 1 月 = 2-28/29）
+static long long AddMonthsEpoch(long long base, int months)
+{
+    if (months <= 0) return base;
+    std::tm t = LocalTm(base);
+    int mon = t.tm_mon + months;
+    t.tm_year += mon / 12;
+    t.tm_mon = mon % 12;
+    int dim = DaysInMonth(t.tm_year + 1900, t.tm_mon + 1);
+    if (t.tm_mday > dim) t.tm_mday = dim;
+    t.tm_isdst = -1;
+    return (long long)std::mktime(&t);
+}
+
+// 把 now → due 拆成 月 / 天 / 时 / 分 / 秒
+static void SplitRemain(long long now, long long due, long long out[5])
+{
+    for (int k = 0; k < 5; ++k) out[k] = 0;
+    if (due <= now) return;
+    int months = 0;
+    while (months < 1200 && AddMonthsEpoch(now, months + 1) <= due) months++;
+    long long rest = due - AddMonthsEpoch(now, months);
+    if (rest < 0) rest = 0;
+    out[0] = months;
+    out[1] = rest / 86400;
+    out[2] = (rest % 86400) / 3600;
+    out[3] = (rest % 3600) / 60;
+    out[4] = rest % 60;
 }
 
 // 计时显示：mm:ss 或 h:mm:ss
@@ -1054,25 +1337,29 @@ static std::wstring FormatClock(long long s)
     return buf;
 }
 
-static std::wstring FormatShortDuration(long long s)
+// 剩余时长：< 1 天用时钟格式，>= 1 天用「N天 hh:mm」，很久以后只显示天数
+static std::wstring FormatRemain(long long s)
 {
-    wchar_t buf[64];
-    if (s < 60) swprintf(buf, 64, L"%lld 秒", s);
-    else if (s % 60 != 0) swprintf(buf, 64, L"%lld 分 %lld 秒", s / 60, s % 60);
-    else {
-        long long m = s / 60;
-        if (m < 60) swprintf(buf, 64, L"%lld 分钟", m);
-        else if (m % 60 == 0) swprintf(buf, 64, L"%lld 小时", m / 60);
-        else swprintf(buf, 64, L"%lld 小时 %lld 分钟", m / 60, m % 60);
-    }
+    if (s < 0) s = -s;
+    if (s < 86400) return FormatClock(s);
+    wchar_t buf[48];
+    long long d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60;
+    if (d < 100) swprintf(buf, 48, L"%lld天 %02lld:%02lld", d, h, m);
+    else swprintf(buf, 48, L"%lld天", d);
     return buf;
 }
 
-static std::wstring TodoKeyOfLine(const std::wstring& line, bool* completed)
+// 截止时刻：今天 / 明天 / 今年内 / 更远
+static std::wstring FormatDueShort(long long due)
 {
-    std::wstring text;
-    if (!ParseTodoLineState(line, &text, completed)) return L"";
-    return TrimCopy(text);
+    std::tm d = LocalTm(due), n = LocalTm(NowEpoch());
+    std::tm tm1 = LocalTm(NowEpoch() + 86400);
+    wchar_t buf[48];
+    if (d.tm_year == n.tm_year && d.tm_yday == n.tm_yday) swprintf(buf, 48, L"今天 %02d:%02d", d.tm_hour, d.tm_min);
+    else if (d.tm_year == tm1.tm_year && d.tm_yday == tm1.tm_yday) swprintf(buf, 48, L"明天 %02d:%02d", d.tm_hour, d.tm_min);
+    else if (d.tm_year == n.tm_year) swprintf(buf, 48, L"%02d-%02d %02d:%02d", d.tm_mon + 1, d.tm_mday, d.tm_hour, d.tm_min);
+    else swprintf(buf, 48, L"%04d-%02d-%02d", d.tm_year + 1900, d.tm_mon + 1, d.tm_mday);
+    return buf;
 }
 
 // 按任务文本切换完成状态（sourceIndex 只是提示，文件期间被改过也能找到正确的行）
@@ -1080,17 +1367,59 @@ static bool ToggleTodoByKey(int sourceIndex, const std::wstring& key)
 {
     std::vector<std::wstring> lines;
     if (!ReadTodoFileLinesW(lines)) return false;
-    int idx = -1;
-    if (sourceIndex >= 0 && (size_t)sourceIndex < lines.size() &&
-        IsTodoLine(lines[(size_t)sourceIndex]) && TodoKeyOfLine(lines[(size_t)sourceIndex], nullptr) == key) {
-        idx = sourceIndex;
-    } else {
-        for (size_t i = 0; i < lines.size(); ++i) {
-            if (IsTodoLine(lines[i]) && TodoKeyOfLine(lines[i], nullptr) == key) { idx = (int)i; break; }
-        }
-    }
-    if (idx < 0) return false;
+    int idx = FindItemLine(lines, sourceIndex, key);
+    if (idx < 0 || !IsTodoLine(lines[(size_t)idx])) return false;
     return ToggleTodoLineCompletion(idx);
+}
+
+// 设置 / 清除截止时间；repeat < 0 表示保留原来的重复间隔
+static bool SetItemDue(int hint, const std::wstring& key, long long due, long long repeat)
+{
+    bool ok = EditItemLine(hint, key, [&](LineInfo& L) {
+        if (L.kind != LK_TODO && L.kind != LK_COUNTDOWN) return true;
+        L.hasDue = true;
+        L.due = due;
+        if (repeat >= 0) L.repeat = repeat;
+        return true;
+    });
+    if (ok) NoteDueSet(key, due);
+    return ok;
+}
+
+static bool ClearItemDue(int hint, const std::wstring& key)
+{
+    return EditItemLine(hint, key, [&](LineInfo& L) {
+        if (L.kind == LK_COUNTDOWN) return false;   // 独立倒计时没有截止时间就没有意义：直接删除
+        L.hasDue = false;
+        L.repeat = 0;
+        return true;
+    });
+}
+
+static bool DeleteItem(int hint, const std::wstring& key)
+{
+    return EditItemLine(hint, key, [](LineInfo&) { return false; });
+}
+
+static bool ToggleItemHidden(int hint, const std::wstring& key)
+{
+    return EditItemLine(hint, key, [](LineInfo& L) { L.hide = !L.hide; return true; });
+}
+
+static bool ToggleItemShow(int hint, const std::wstring& key)
+{
+    return EditItemLine(hint, key, [](LineInfo& L) {
+        if (L.kind == LK_TODO || L.kind == LK_COUNTDOWN) L.show = !L.show;
+        return true;
+    });
+}
+
+static bool ToggleGroupFold(int hint, const std::wstring& key)
+{
+    return EditItemLine(hint, key, [](LineInfo& L) {
+        if (L.kind == LK_GROUP) L.fold = !L.fold;
+        return true;
+    });
 }
 
 // ============================================================================
@@ -1157,6 +1486,8 @@ static void StartCardAlert(HWND hwnd, const std::wstring& title, const std::wstr
     g_shakeTimes = 0;
     if (!g_alertActive) {
         g_alertActive = true;
+        g_peekActive = false;   // 醒目提醒接管轻浮层
+        g_peekGlance = false;
         ResetHoverHide(hwnd);   // 覆盖悬停隐藏：立即完全显示且可点击
     }
     RaiseForAlert(hwnd);
@@ -1180,52 +1511,160 @@ static void StopCardAlert(HWND hwnd)
     SetAnimTimer(hwnd);
 }
 
-// 每秒检查任务倒计时是否到点
-static void CheckTaskTimers(HWND hwnd)
+// 前台是否处于全屏 / 演示 / 免打扰（此时不做轻浮现）
+static bool UserIsBusy()
 {
-    if (!g_taskTimersLoaded) LoadTaskTimers();
-    std::vector<std::wstring> lines;
-    bool fileOk = ReadTodoFileLinesW(lines);
-    std::unordered_map<std::wstring, bool> openTasks;   // key -> 是否未完成
-    for (const auto& l : lines) {
-        bool done = false;
-        if (!IsTodoLine(l)) continue;
-        std::wstring k = TodoKeyOfLine(l, &done);
-        if (!done) openTasks[k] = true;
-        else if (!openTasks.count(k)) openTasks[k] = false;
-    }
+    QUERY_USER_NOTIFICATION_STATE st;
+    if (FAILED(SHQueryUserNotificationState(&st))) return false;
+    return st == QUNS_BUSY || st == QUNS_RUNNING_D3D_FULL_SCREEN || st == QUNS_PRESENTATION_MODE;
+}
 
-    bool changed = false;
-    std::vector<TaskTimer> due;
-    for (auto& t : g_taskTimers) {
-        if (!t.countdown || t.fired || t.start == 0) continue;
-        if (TimerElapsed(t) < t.duration) continue;
-        t.fired = true;
-        changed = true;
-        auto it = openTasks.find(t.key);
-        if (fileOk && (it == openTasks.end() || !it->second)) continue;   // 任务已完成或已删除：静默
-        due.push_back(t);
+static void EndPeek(HWND hwnd)
+{
+    if (!g_peekActive) return;
+    g_peekActive = false;
+    g_peekGlance = false;
+    ApplyDisplayMode(hwnd, g_displayMode);   // 沉回桌面层，并恢复完全不透明、可点击
+}
+
+// 智能浮现：每秒随截止时间检查一起调用，决定是否以轻浮层浮到最上面
+static void UpdatePeek(HWND hwnd)
+{
+    if (g_displayMode != 2 || g_alertActive || g_restoringAlert) {
+        if (g_displayMode != 2) { g_peekActive = false; g_peekGlance = false; }
+        return;   // 提醒期间由提醒接管层级，结束后 StopCardAlert 会恢复显示模式
     }
-    if (changed) SaveTaskTimers();
-    for (const auto& t : due) {
-        StartCardAlert(hwnd, L"时间到 · " + FormatShortDuration(t.duration), ProcessPlaceholdersW(t.key), t.key);
+    long long now = NowEpoch();
+    if (g_lastGlance == 0) g_lastGlance = now;   // 启动后先等一个完整间隔
+    bool busy = UserIsBusy();
+    bool upcoming = g_nextOpenDue > 0 && g_nextOpenDue - now <= (long long)g_surfaceLeadMin * 60;
+    bool glance = false;
+    if (g_peekActive && g_peekGlance && now < g_peekUntil) glance = true;
+    else if (!g_peekActive && g_surfaceEveryMin > 0 && g_hasOpenItems
+             && now - g_lastGlance >= (long long)g_surfaceEveryMin * 60) {
+        g_lastGlance = now;
+        if (!busy) { glance = true; g_peekUntil = now + PEEK_GLANCE_SEC; }
     }
+    bool want = !busy && (upcoming || glance);
+    if (g_dragging || g_contextMenuOpen) want = g_peekActive;   // 操作中不切换层级
+    if (want && !g_peekActive) {
+        g_peekActive = true;
+        g_peekGlance = !upcoming;
+        g_hoverAlpha = 0;                 // 从透明淡入到轻浮层
+        RaiseForAlert(hwnd);
+        RenderTip(hwnd);
+        g_hoverHidden = false;
+        UpdateHoverHideTimer(hwnd);
+        SetClickThrough(hwnd, true);
+        g_hoverHidden = true;
+    } else if (g_peekActive) {
+        if (upcoming) g_peekGlance = false;
+        if (!want) EndPeek(hwnd);
+    }
+}
+
+// 每秒检查截止时间是否已到（任务与独立倒计时共用）
+static void CheckDeadlines(HWND hwnd)
+{
+    if (!g_dueMetaLoaded) LoadDueMeta();
+    std::vector<std::wstring> lines;
+    if (!ReadTodoFileLinesW(lines)) return;
+    long long now = NowEpoch();
+    for (auto& m : g_dueMeta) m.seen = false;
+    bool metaChanged = false, fileChanged = false;
+    struct Fire { std::wstring key, title, detail; };
+    std::vector<Fire> fires;
+
+    auto meta = [&](const std::wstring& key, long long due) -> size_t {
+        int i = FindDueMeta(key, due);
+        if (i < 0) {
+            DueMeta m;
+            m.key = key; m.due = due; m.setAt = now;
+            g_dueMeta.push_back(m);
+            metaChanged = true;
+            i = (int)g_dueMeta.size() - 1;
+        }
+        g_dueMeta[(size_t)i].seen = true;
+        return (size_t)i;
+    };
+
+    long long nextDue = 0;
+    bool openItems = false;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        LineInfo L = ParseLine(lines[i]);
+        if ((L.kind == LK_TODO || L.kind == LK_COUNTDOWN) && !L.ok && !L.hide) openItems = true;
+        if ((L.kind != LK_TODO && L.kind != LK_COUNTDOWN) || !L.hasDue) continue;
+        std::wstring key = ItemKey(L);
+        size_t mi = meta(key, L.due);
+        if (!L.ok && L.due > now && (nextDue == 0 || L.due < nextDue)) nextDue = L.due;
+        if (L.ok || g_dueMeta[mi].fired || now < L.due) continue;
+        g_dueMeta[mi].fired = true;
+        metaChanged = true;
+
+        Fire f;
+        f.key = key;
+        std::wstring name = ProcessPlaceholdersW(TrimCopy(L.text));
+        if (L.kind == LK_COUNTDOWN) {
+            f.title = name.empty() ? L"倒计时结束" : name;
+            f.detail = L"倒计时结束 · " + FormatDueText(L.due);
+        } else {
+            f.title = L"截止时间到";
+            f.detail = name;
+        }
+        if (L.repeat > 0) {   // 重复：截止时间顺延到下一个未来时刻
+            long long nd = L.due;
+            while (nd <= now) nd += L.repeat;
+            L.due = nd;
+            lines[i] = FormatLine(L);
+            fileChanged = true;
+            size_t mj = meta(key, nd);
+            g_dueMeta[mj].setAt = nd - L.repeat;
+            g_dueMeta[mj].fired = false;
+            f.detail += L" · 下次 " + FormatDueShort(nd);
+        }
+        fires.push_back(f);
+    }
+    size_t before = g_dueMeta.size();
+    g_dueMeta.erase(std::remove_if(g_dueMeta.begin(), g_dueMeta.end(),
+        [](const DueMeta& m) { return !m.seen; }), g_dueMeta.end());
+    if (g_dueMeta.size() != before) metaChanged = true;
+    if (fileChanged) WriteTodoFileLinesW(lines);
+    if (metaChanged) SaveDueMeta();
+    g_nextOpenDue = nextDue;
+    g_hasOpenItems = openItems;
+    for (const auto& f : fires) StartCardAlert(hwnd, f.title, f.detail, f.key);
+    UpdatePeek(hwnd);
 }
 
 static std::vector<std::pair<int, std::wstring>> BannerButtonSpec()
 {
     std::vector<std::pair<int, std::wstring>> v;
-    bool task = !g_alertTaskKey.empty();
+    bool task = !g_alertTaskKey.empty() && !IsCountdownKey(g_alertTaskKey);
     if (task) v.push_back({ BANNER_DONE, L"完成" });
-    if (task || !g_reminderArmed) v.push_back({ BANNER_SNOOZE, L"+5 分钟" });
+    v.push_back({ BANNER_SNOOZE, L"+5 分钟" });
     v.push_back({ BANNER_DISMISS, L"知道了" });
     return v;
+}
+
+// 「知道了」：不重复的独立倒计时到点后从文件里移除；任务保留截止时间（显示为已超时）
+static void DismissDueItem(const std::wstring& key)
+{
+    if (!IsCountdownKey(key)) return;
+    std::vector<std::wstring> lines;
+    if (!ReadTodoFileLinesW(lines)) return;
+    int idx = FindItemLine(lines, -1, key);
+    if (idx < 0) return;
+    LineInfo L = ParseLine(lines[(size_t)idx]);
+    if (L.kind == LK_COUNTDOWN && L.repeat == 0 && L.due <= NowEpoch()) {
+        lines.erase(lines.begin() + idx);
+        WriteTodoFileLinesW(lines);
+    }
 }
 
 static void HandleBannerAction(HWND hwnd, int action)
 {
     std::wstring key = g_alertTaskKey;
-    if (action == BANNER_DONE && !key.empty()) {
+    if (action == BANNER_DONE && !key.empty() && !IsCountdownKey(key)) {
         StopCardAlert(hwnd);
         for (const auto& h : g_todoHitRects) {
             if (h.key == key && !h.completed) {
@@ -1237,17 +1676,10 @@ static void HandleBannerAction(HWND hwnd, int action)
         if (ToggleTodoByKey(-1, key)) RenderTip(hwnd);
         return;
     }
-    if (action == BANNER_SNOOZE) {
-        if (!key.empty()) {
-            SnoozeTaskTimer(key, 5 * 60);
-        } else if (!g_reminderArmed) {
-            g_reminderArmed = true;
-            g_reminderDue = system_clock::now() + minutes(5);
-            g_reminderTitle = L"倒计时结束";
-            g_reminderDetail = L"稍后提醒（5 分钟）已到";
-            g_reminderIsCountdown = false;
-            g_reminderIntervalSeconds = 0;
-        }
+    if (action == BANNER_SNOOZE && !key.empty()) {
+        SetItemDue(-1, key, NowEpoch() + 5 * 60, -1);   // 截止时间改为 5 分钟后
+    } else if (action == BANNER_DISMISS) {
+        DismissDueItem(key);
     }
     StopCardAlert(hwnd);
 }
@@ -1283,7 +1715,7 @@ static void CommitCompletion(HWND hwnd)
     if (!g_completeAnim.active) return;
     CompleteAnim a = g_completeAnim;
     g_completeAnim.active = false;
-    SnapshotRowsForSettle();
+    SnapshotRowsForSettle();   // 开启「已完成项沉底」时各行平滑滑到新位置；否则原位不动
     if (ToggleTodoByKey(a.sourceIndex, a.key)) {
         g_justCompletedKey = a.key;
         if (TaskTimer* t = FindTaskTimer(a.key)) {   // 完成即停表，保留最终用时
@@ -1345,26 +1777,375 @@ static std::wstring Ellipsize(const std::wstring& s, size_t maxChars)
     return s.substr(0, maxChars) + L"…";
 }
 
-static void PromptTaskCountdown(HWND hwnd, const std::wstring& key)
+// ============================================================================
+//  倒计时设定对话框
+//  两种设定方式可随时切换、互相换算：「截止时间」（年月日 时分秒）与「剩余时长」（月 天 时 分 秒）。
+//  确定后一律换算成截止时间（@YYYY-MM-DD HH:MM:SS）写进 TODO 文件。
+// ============================================================================
+#define IDC_DUE_NAME     3301
+#define IDC_DUE_TAB_ABS  3302
+#define IDC_DUE_TAB_REL  3303
+#define IDC_DUE_PICKER   3304
+#define IDC_DUE_REL0     3310   // 3310..3314：月 天 时 分 秒
+#define IDC_DUE_SPIN0    3320
+#define IDC_DUE_REPEAT   3330
+#define IDC_DUE_PREVIEW  3331
+
+struct DueDialogState {
+    std::wstring heading, sub;
+    bool askName = false;
+    std::wstring name;
+    long long due = 0;          // 初始值 / 结果
+    long long repeat = 0;       // 初始值 / 结果
+    long long fixedRepeat = 0;  // 编辑已有的重复项时保留原间隔
+    bool repeatChecked = false;
+    int mode = 1;               // 0 = 截止时间，1 = 剩余时长
+    bool accepted = false;
+    double k = 1.0;             // DPI 缩放
+    HFONT font = NULL, fontBold = NULL, fontSmall = NULL;
+    HBRUSH bg = NULL;
+    HWND nameEdit = NULL, tabAbs = NULL, tabRel = NULL, picker = NULL, preview = NULL, repeatBox = NULL;
+    HWND relEdit[5] = {}, relSpin[5] = {}, relLabel[5] = {};
+};
+
+static void PickerSet(HWND picker, long long due)
 {
-    std::wstring value;
-    if (!ShowTextPrompt(hwnd, L"任务倒计时", L"输入分钟数，或 MM:SS / HH:MM:SS", L"25", value)) return;
-    int seconds = 0;
-    if (!TryParseCountdownSeconds(value, seconds)) {
-        MessageBoxW(hwnd, L"请输入有效的倒计时时长。", L"DesktopTip", MB_OK | MB_ICONWARNING);
-        return;
-    }
-    StartTaskCountdown(key, seconds);
+    std::tm t = LocalTm(due);
+    SYSTEMTIME st = {};
+    st.wYear = (WORD)(t.tm_year + 1900); st.wMonth = (WORD)(t.tm_mon + 1); st.wDay = (WORD)t.tm_mday;
+    st.wDayOfWeek = (WORD)t.tm_wday;
+    st.wHour = (WORD)t.tm_hour; st.wMinute = (WORD)t.tm_min; st.wSecond = (WORD)t.tm_sec;
+    SendMessageW(picker, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&st);
 }
 
-static void HandleTaskTimerCommand(HWND hwnd, int id)
+static long long PickerGet(HWND picker)
+{
+    SYSTEMTIME st = {};
+    if (SendMessageW(picker, DTM_GETSYSTEMTIME, 0, (LPARAM)&st) != GDT_VALID) return 0;
+    return LocalEpoch(st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+}
+
+static long long RelGet(DueDialogState* s, long long now)
+{
+    long long v[5] = { 0, 0, 0, 0, 0 };
+    for (int i = 0; i < 5; ++i) {
+        wchar_t buf[32] = { 0 };
+        GetWindowTextW(s->relEdit[i], buf, 32);
+        long long n = 0;
+        for (wchar_t* p = buf; *p; ++p) {
+            if (*p >= L'0' && *p <= L'9') { n = n * 10 + (*p - L'0'); if (n > 100000000) break; }
+        }
+        v[i] = n;
+    }
+    if (v[0] > 1200) v[0] = 1200;
+    return AddMonthsEpoch(now, (int)v[0]) + v[1] * 86400 + v[2] * 3600 + v[3] * 60 + v[4];
+}
+
+static void RelSet(DueDialogState* s, long long now, long long due)
+{
+    long long v[5];
+    SplitRemain(now, due, v);
+    for (int i = 0; i < 5; ++i) SetWindowTextW(s->relEdit[i], std::to_wstring(v[i]).c_str());
+}
+
+static long long DueDlgCurrent(DueDialogState* s)
+{
+    long long now = NowEpoch();
+    return s->mode == 0 ? PickerGet(s->picker) : RelGet(s, now);
+}
+
+static void DueDlgPreview(DueDialogState* s)
+{
+    long long now = NowEpoch();
+    long long due = DueDlgCurrent(s);
+    std::wstring text;
+    if (due <= now) {
+        text = L"这个时间已经过去了，请设一个将来的时刻";
+    } else if (s->mode == 0) {
+        text = L"还剩 " + FormatRemain(due - now);
+    } else {
+        text = L"将于 " + FormatDueText(due) + L" 到点";
+    }
+    if (due > now && SendMessageW(s->repeatBox, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        long long rep = s->fixedRepeat > 0 ? s->fixedRepeat : due - now;
+        text += L"，之后每隔 " + FormatRemain(rep) + L" 重复";
+    }
+    SetWindowTextW(s->preview, text.c_str());
+}
+
+static void DueDlgShowMode(DueDialogState* s)
+{
+    ShowWindow(s->picker, s->mode == 0 ? SW_SHOW : SW_HIDE);
+    for (int i = 0; i < 5; ++i) {
+        ShowWindow(s->relEdit[i], s->mode == 1 ? SW_SHOW : SW_HIDE);
+        ShowWindow(s->relSpin[i], s->mode == 1 ? SW_SHOW : SW_HIDE);
+        ShowWindow(s->relLabel[i], s->mode == 1 ? SW_SHOW : SW_HIDE);
+    }
+    SendMessageW(s->tabAbs, BM_SETCHECK, s->mode == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->tabRel, BM_SETCHECK, s->mode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+static LRESULT CALLBACK DueDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    DueDialogState* s = (DueDialogState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+        s = (DueDialogState*)cs->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)s);
+        HINSTANCE hi = GetModuleHandle(NULL);
+        double k = s->k;
+        auto X = [k](int v) { return (int)(v * k + 0.5); };
+        auto mk = [&](DWORD ex, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, HFONT f) {
+            HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, X(x), X(y), X(w), X(h),
+                hwnd, (HMENU)(INT_PTR)id, hi, NULL);
+            SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+            return c;
+        };
+        const int W = 400, P = 22;
+        int y = 18;
+        mk(0, L"STATIC", s->heading.c_str(), 0, P, y, W - 2 * P, 24, 0, s->fontBold);
+        y += 26;
+        if (!s->sub.empty()) { mk(0, L"STATIC", s->sub.c_str(), SS_ENDELLIPSIS | SS_NOPREFIX, P, y, W - 2 * P, 20, 1, s->fontSmall); y += 22; }
+        y += 10;
+        if (s->askName) {
+            mk(0, L"STATIC", L"名称（可留空）", 0, P, y, W - 2 * P, 20, 0, s->font);
+            y += 22;
+            s->nameEdit = mk(WS_EX_CLIENTEDGE, L"EDIT", s->name.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, P, y, W - 2 * P, 28, IDC_DUE_NAME, s->font);
+            y += 40;
+        }
+        s->tabAbs = mk(0, L"BUTTON", L"截止时间", WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON | BS_PUSHLIKE, P, y, 112, 30, IDC_DUE_TAB_ABS, s->font);
+        s->tabRel = mk(0, L"BUTTON", L"剩余时长", BS_AUTORADIOBUTTON | BS_PUSHLIKE, P + 112, y, 112, 30, IDC_DUE_TAB_REL, s->font);
+        y += 44;
+        s->picker = mk(0, DATETIMEPICK_CLASSW, L"", WS_TABSTOP | WS_GROUP, P, y, 260, 30, IDC_DUE_PICKER, s->font);
+        SendMessageW(s->picker, DTM_SETFORMATW, 0, (LPARAM)L"yyyy'-'MM'-'dd'   'HH':'mm':'ss");
+        static const wchar_t* units[5] = { L"月", L"天", L"时", L"分", L"秒" };
+        static const int maxv[5] = { 1200, 9999, 999, 999, 999 };
+        for (int i = 0; i < 5; ++i) {
+            int x = P + i * 71;
+            s->relEdit[i] = mk(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_TABSTOP | ES_NUMBER | ES_RIGHT, x, y + 1, 48, 28, IDC_DUE_REL0 + i, s->font);
+            s->relSpin[i] = CreateWindowExW(0, UPDOWN_CLASSW, L"", WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT |
+                UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(IDC_DUE_SPIN0 + i), hi, NULL);
+            SendMessageW(s->relSpin[i], UDM_SETBUDDY, (WPARAM)s->relEdit[i], 0);
+            SendMessageW(s->relSpin[i], UDM_SETRANGE32, 0, maxv[i]);
+            s->relLabel[i] = mk(0, L"STATIC", units[i], SS_CENTERIMAGE, x + 50, y, 20, 30, 0, s->font);
+        }
+        y += 42;
+        s->preview = mk(0, L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, P, y, W - 2 * P, 20, IDC_DUE_PREVIEW, s->fontSmall);
+        y += 30;
+        s->repeatBox = mk(0, L"BUTTON", L"到点后按同样的间隔重复", WS_TABSTOP | BS_AUTOCHECKBOX, P, y, W - 2 * P, 24, IDC_DUE_REPEAT, s->font);
+        SendMessageW(s->repeatBox, BM_SETCHECK, s->repeatChecked ? BST_CHECKED : BST_UNCHECKED, 0);
+        y += 44;
+        mk(0, L"BUTTON", L"确定", WS_TABSTOP | BS_DEFPUSHBUTTON, W - P - 2 * 92 - 10, y, 92, 32, IDOK, s->font);
+        mk(0, L"BUTTON", L"取消", WS_TABSTOP, W - P - 92, y, 92, 32, IDCANCEL, s->font);
+
+        long long now = NowEpoch();
+        PickerSet(s->picker, s->due);
+        RelSet(s, now, s->due);
+        DueDlgShowMode(s);
+        DueDlgPreview(s);
+        SetFocus(s->askName ? s->nameEdit : (s->mode == 0 ? s->picker : s->relEdit[3]));
+        if (s->mode == 1) SendMessageW(s->relEdit[3], EM_SETSEL, 0, -1);
+        SetTimer(hwnd, 1, 1000, NULL);   // 「还剩…」每秒更新
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wParam;
+        SetBkMode(dc, TRANSPARENT);
+        HWND c = (HWND)lParam;
+        int id = GetDlgCtrlID(c);
+        SetTextColor(dc, (id == IDC_DUE_PREVIEW || id == 1) ? RGB(110, 116, 128) : RGB(28, 32, 40));
+        return (LRESULT)s->bg;
+    }
+    case WM_CTLCOLORBTN:
+        return (LRESULT)s->bg;
+    case WM_TIMER:
+        if (s && s->mode == 0) DueDlgPreview(s);
+        return 0;
+    case WM_NOTIFY: {
+        NMHDR* nh = (NMHDR*)lParam;
+        if (nh && nh->idFrom == IDC_DUE_PICKER && nh->code == DTN_DATETIMECHANGE) DueDlgPreview(s);
+        break;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam), code = HIWORD(wParam);
+        if ((id == IDC_DUE_TAB_ABS || id == IDC_DUE_TAB_REL) && code == BN_CLICKED) {
+            int nm = (id == IDC_DUE_TAB_ABS) ? 0 : 1;
+            if (nm != s->mode) {
+                long long now = NowEpoch();
+                long long due = DueDlgCurrent(s);
+                if (due <= now) due = now + 60;
+                s->mode = nm;
+                if (nm == 0) PickerSet(s->picker, due); else RelSet(s, now, due);
+                DueDlgShowMode(s);
+                DueDlgPreview(s);
+            }
+            return 0;
+        }
+        if (id >= IDC_DUE_REL0 && id < IDC_DUE_REL0 + 5 && code == EN_CHANGE) { DueDlgPreview(s); return 0; }
+        if (id == IDC_DUE_REPEAT) { DueDlgPreview(s); return 0; }
+        if (id == IDOK) {
+            long long now = NowEpoch();
+            long long due = DueDlgCurrent(s);
+            if (due <= now) {
+                MessageBoxW(hwnd, L"请设一个将来的时刻。", L"DesktopTip", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            s->due = due;
+            bool rep = SendMessageW(s->repeatBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            s->repeat = rep ? (s->fixedRepeat > 0 ? s->fixedRepeat : due - now) : 0;
+            if (s->askName) {
+                wchar_t buf[512] = { 0 };
+                GetWindowTextW(s->nameEdit, buf, 512);
+                s->name = TrimCopy(buf);
+            }
+            s->accepted = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, 1);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool ShowDueDialog(HWND owner, DueDialogState& st)
+{
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = DueDialogProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.lpszClassName = L"DesktopTipDueDialog";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+        wc.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DESKTOPTIP));
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    HDC sdc = GetDC(NULL);
+    st.k = GetDeviceCaps(sdc, LOGPIXELSY) / 96.0;
+    ReleaseDC(NULL, sdc);
+    if (st.k < 1.0) st.k = 1.0;
+    st.font = CreateFontW(-(int)(14 * st.k), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    st.fontBold = CreateFontW(-(int)(17 * st.k), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    st.fontSmall = CreateFontW(-(int)(12.5 * st.k), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    st.bg = (HBRUSH)GetStockObject(WHITE_BRUSH);
+
+    int clientH = 18 + 26 + (st.sub.empty() ? 0 : 22) + 10 + (st.askName ? 62 : 0) + 44 + 42 + 30 + 44 + 32 + 20;
+    RECT rc = { 0, 0, (LONG)(400 * st.k), (LONG)(clientH * st.k) };
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    DWORD ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_DLGMODALFRAME;
+    AdjustWindowRectEx(&rc, style, FALSE, ex);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    RECT wa;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = wa.left + ((wa.right - wa.left) - w) / 2;
+    int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
+
+    HWND dlg = CreateWindowExW(ex, L"DesktopTipDueDialog", st.askName ? L"倒计时" : L"任务倒计时",
+        style, x, y, w, h, owner, NULL, GetModuleHandle(NULL), &st);
+    if (dlg) {
+        ShowWindow(dlg, SW_SHOW);
+        SetForegroundWindow(dlg);
+        if (owner) EnableWindow(owner, FALSE);
+        MSG msg;
+        BOOL gm = TRUE;
+        while (IsWindow(dlg) && (gm = GetMessageW(&msg, NULL, 0, 0)) > 0) {
+            if (!IsDialogMessageW(dlg, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if (owner) EnableWindow(owner, TRUE);
+        if (gm == 0) PostQuitMessage((int)msg.wParam);
+    }
+    DeleteObject(st.font);
+    DeleteObject(st.fontBold);
+    DeleteObject(st.fontSmall);
+    return st.accepted;
+}
+
+// 为任务 / 独立倒计时设定截止时间（对话框）
+static void PromptItemDue(HWND hwnd, int hint, const std::wstring& key)
+{
+    std::vector<std::wstring> lines;
+    if (!ReadTodoFileLinesW(lines)) return;
+    int idx = FindItemLine(lines, hint, key);
+    if (idx < 0) return;
+    LineInfo L = ParseLine(lines[(size_t)idx]);
+    long long now = NowEpoch();
+
+    DueDialogState st;
+    bool isCd = (L.kind == LK_COUNTDOWN);
+    st.heading = isCd ? L"修改倒计时" : (L.hasDue ? L"修改截止时间" : L"设置截止时间");
+    if (!isCd) st.sub = ProcessPlaceholdersW(TrimCopy(L.text));
+    st.askName = isCd;
+    st.name = L.text;
+    st.due = (L.hasDue && L.due > now) ? L.due : now + 25 * 60;
+    st.fixedRepeat = L.repeat;
+    st.repeatChecked = L.repeat > 0;
+    st.mode = g_dueInputMode;
+    if (!ShowDueDialog(hwnd, st)) return;
+    g_dueInputMode = st.mode;
+
+    std::wstring newKey = key;
+    bool ok = EditItemLine(idx, key, [&](LineInfo& E) {
+        if (E.kind != LK_TODO && E.kind != LK_COUNTDOWN) return true;
+        if (E.kind == LK_COUNTDOWN) E.text = st.name;
+        E.hasDue = true;
+        E.due = st.due;
+        E.repeat = st.repeat;
+        newKey = ItemKey(E);
+        return true;
+    });
+    if (ok) NoteDueSet(newKey, st.due);
+    if (g_alertActive && g_alertTaskKey == key) StopCardAlert(hwnd);
+    confWrite();
+}
+
+// 新建独立倒计时（不挂在任务上），同样写进 TODO 文件
+static void PromptNewCountdown(HWND hwnd)
+{
+    DueDialogState st;
+    st.heading = L"新建倒计时";
+    st.sub = L"会以「! 名称 @截止时间」的形式写进 TODO 文件";
+    st.askName = true;
+    st.due = NowEpoch() + 10 * 60;
+    st.repeatChecked = g_countdownRepeatEnabled;
+    st.mode = g_dueInputMode;
+    if (!ShowDueDialog(hwnd, st)) return;
+    g_dueInputMode = st.mode;
+    g_countdownRepeatEnabled = st.repeat > 0;
+    if (InsertCountdownLine(st.name, st.due, st.repeat)) {
+        NoteDueSet(KEY_CD_PREFIX + st.name, st.due);
+    } else {
+        MessageBoxW(hwnd, L"无法写入 TODO 文件。", L"DesktopTip", MB_OK | MB_ICONWARNING);
+    }
+    confWrite();
+}
+
+static void HandleItemCommand(HWND hwnd, int id)
 {
     std::wstring key = g_menuTaskKey;
+    int hint = g_menuHint;
     if (key.empty()) return;
+    bool stopAlert = false;
     if (id >= ID_TASK_CD_FIRST && id < ID_TASK_CD_FIRST + kTaskPresetCount) {
-        StartTaskCountdown(key, (long long)kTaskPresetMinutes[id - ID_TASK_CD_FIRST] * 60);
-    } else if (id == ID_TASK_CD_CUSTOM) {
-        PromptTaskCountdown(hwnd, key);
+        SetItemDue(hint, key, NowEpoch() + (long long)kTaskPresetMinutes[id - ID_TASK_CD_FIRST] * 60, -1);
+        stopAlert = true;
+    } else if (id == ID_TASK_DUE_SET) {
+        PromptItemDue(hwnd, hint, key);
+    } else if (id == ID_TASK_DUE_CLEAR) {
+        ClearItemDue(hint, key);
+        stopAlert = true;
     } else if (id == ID_TASK_STOPWATCH) {
         StartTaskStopwatch(key);
     } else if (id == ID_TASK_PAUSE) {
@@ -1373,136 +2154,24 @@ static void HandleTaskTimerCommand(HWND hwnd, int id)
         RestartTaskTimer(key);
     } else if (id == ID_TASK_REMOVE) {
         RemoveTaskTimer(key);
-        if (g_alertActive && g_alertTaskKey == key) StopCardAlert(hwnd);
+    } else if (id == ID_ITEM_HIDE) {
+        SnapshotRowsForSettle();
+        ToggleItemHidden(hint, key);
+        SetAnimTimer(hwnd);
+    } else if (id == ID_GROUP_FOLD) {
+        SnapshotRowsForSettle();
+        ToggleGroupFold(hint, key);
+        SetAnimTimer(hwnd);
+    } else if (id == ID_ITEM_SHOW) {
+        SnapshotRowsForSettle();
+        ToggleItemShow(hint, key);
+        SetAnimTimer(hwnd);
+    } else if (id == ID_CD_DELETE) {
+        DeleteItem(hint, key);
+        stopAlert = true;
     }
+    if (stopAlert && g_alertActive && g_alertTaskKey == key) StopCardAlert(hwnd);
     RenderTip(hwnd);
-}
-
-static void ArmCountdown(HWND hwnd, int seconds)
-{
-    g_reminderArmed = true;
-    g_reminderDue = system_clock::now() + std::chrono::seconds(seconds);
-    g_reminderTitle = L"倒计时结束";
-    g_reminderDetail = L"倒计时 " + FormatDuration(seconds) + L" 已到";
-    g_reminderIsCountdown = true;
-    g_reminderIntervalSeconds = seconds;
-    std::wstring msg = L"倒计时已开始：" + FormatDuration(seconds);
-    if (g_countdownRepeatEnabled) {
-        msg += L"（重复计时已开启）";
-    }
-    MessageBoxW(hwnd, msg.c_str(), L"DesktopTip", MB_OK | MB_ICONINFORMATION);
-}
-
-static void ShowCountdownPrompt(HWND hwnd)
-{
-    std::wstring value;
-    if (!ShowTextPrompt(hwnd, L"设置倒计时", L"输入分钟数，或 MM:SS / HH:MM:SS", L"10", value)) {
-        return;
-    }
-    int seconds = 0;
-    if (!TryParseCountdownSeconds(value, seconds)) {
-        MessageBoxW(hwnd, L"请输入有效的倒计时时长。", L"DesktopTip", MB_OK | MB_ICONWARNING);
-        return;
-    }
-    ArmCountdown(hwnd, seconds);
-}
-
-static void ShowAlarmPrompt(HWND hwnd)
-{
-    auto defaultTime = system_clock::now() + minutes(5);
-    std::time_t t = system_clock::to_time_t(defaultTime);
-    std::tm tmv{};
-    localtime_s(&tmv, &t);
-    wchar_t initial[16];
-    swprintf(initial, 16, L"%02d:%02d", tmv.tm_hour, tmv.tm_min);
-
-    std::wstring value;
-    if (!ShowTextPrompt(hwnd, L"设置闹钟", L"输入闹钟时间 HH:MM 或 HH:MM:SS", initial, value)) {
-        return;
-    }
-    system_clock::time_point due;
-    if (!TryParseAlarmTime(value, due)) {
-        MessageBoxW(hwnd, L"请输入有效的闹钟时间。", L"DesktopTip", MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    g_reminderArmed = true;
-    g_reminderDue = due;
-    g_reminderTitle = L"闹钟时间到";
-    g_reminderDetail = L"设定时间：" + FormatTimePoint(due);
-    g_reminderIsCountdown = false;
-    g_reminderIntervalSeconds = 0;
-    std::wstring msg = L"闹钟已设置：" + FormatTimePoint(due);
-    MessageBoxW(hwnd, msg.c_str(), L"DesktopTip", MB_OK | MB_ICONINFORMATION);
-}
-
-static void CheckReminder(HWND hwnd)
-{
-    if (!g_reminderArmed) return;
-
-    auto now = system_clock::now();
-    if (now < g_reminderDue) return;
-
-    bool repeatCountdown = g_reminderIsCountdown && g_countdownRepeatEnabled && g_reminderIntervalSeconds > 0;
-    int repeatSeconds = g_reminderIntervalSeconds;
-
-    auto scheduleNextRepeatCountdown = [&](const system_clock::time_point& fromTime) {
-        if (!repeatCountdown) return;
-        auto nextDue = g_reminderDue + std::chrono::seconds(repeatSeconds);
-        while (nextDue <= fromTime) {
-            nextDue += std::chrono::seconds(repeatSeconds);
-        }
-        g_reminderArmed = true;
-        g_reminderDue = nextDue;
-        g_reminderTitle = L"倒计时结束";
-        g_reminderDetail = L"重复倒计时 " + FormatDuration(repeatSeconds) + L" 已到";
-        g_reminderIsCountdown = true;
-        g_reminderIntervalSeconds = repeatSeconds;
-    };
-
-    // 重复倒计时命中时，如果上一次提醒还没处理，则跳过本次提醒，直接进入下一轮计时。
-    if (g_alertActive) {
-        if (repeatCountdown) {
-            scheduleNextRepeatCountdown(now);
-        }
-        return;
-    }
-
-    auto previousDue = g_reminderDue;
-    std::wstring title = g_reminderTitle;
-    std::wstring detail = g_reminderDetail;
-
-    g_reminderArmed = false;
-    StartCardAlert(hwnd, title, detail, L"");
-
-    if (repeatCountdown) {
-        auto nextDue = previousDue + std::chrono::seconds(repeatSeconds);
-        while (nextDue <= now) {
-            nextDue += std::chrono::seconds(repeatSeconds);
-        }
-        g_reminderArmed = true;
-        g_reminderDue = nextDue;
-        g_reminderTitle = L"倒计时结束";
-        g_reminderDetail = L"重复倒计时 " + FormatDuration(repeatSeconds) + L" 已到";
-        g_reminderIsCountdown = true;
-        g_reminderIntervalSeconds = repeatSeconds;
-    } else {
-        g_reminderIsCountdown = false;
-        g_reminderIntervalSeconds = 0;
-    }
-}
-
-static std::wstring GetReminderStatusText()
-{
-    if (!g_reminderArmed) return L"";
-    auto now = system_clock::now();
-    int remaining = (int)duration_cast<seconds>(g_reminderDue - now).count();
-    if (remaining < 0) remaining = 0;
-    std::wstring status = L"已设置：" + g_reminderTitle + L"（剩余 " + FormatDuration(remaining) + L"）";
-    if (g_reminderIsCountdown && g_countdownRepeatEnabled && g_reminderIntervalSeconds > 0) {
-        status += L" · 重复";
-    }
-    return status;
 }
 
 // 右键菜单的消息处理
@@ -1536,9 +2205,9 @@ void ChooseFontFamily(HWND);
 
 struct SliderRow { const wchar_t* caption; int ctrlId; int y; };
 static void SP_Rows(SliderRow rows[3]) {
-    rows[0] = { L"字号  Font size",       IDC_SL_FONT,    SP_TITLE + 26 };
-    rows[1] = { L"行距  Spacing",          IDC_SL_SPACE,   SP_TITLE + 104 };
-    rows[2] = { L"卡片透明度  Opacity",    IDC_SL_OPACITY, SP_TITLE + 182 };
+    rows[0] = { L"字号",       IDC_SL_FONT,    SP_TITLE + 26 };
+    rows[1] = { L"行距",         IDC_SL_SPACE,   SP_TITLE + 104 };
+    rows[2] = { L"卡片不透明度",   IDC_SL_OPACITY, SP_TITLE + 182 };
 }
 
 static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1619,7 +2288,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         SelectObject(dc, obr); SelectObject(dc, ob); DeleteObject(bp);
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, g_uiTitle); SetTextColor(dc, RGB(244,245,248));
-        TextOutW(dc, SP_PAD, 19, L"DesktopTip 设置", 13);
+        TextOutW(dc, SP_PAD, 19, L"外观", 2);
         SetTextColor(dc, RGB(150,158,172));
         RECT xr = { SP_W-48, 15, SP_W-18, 45 };
         DrawTextW(dc, L"\u2715", -1, &xr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -1712,84 +2381,115 @@ void ShowContextMenu(HWND hwnd, bool fromCard = false) {
 
     HMENU hMenu = CreatePopupMenu();
 
-    // 在某条待办上右键：顶部出现「任务计时」子菜单（倒计时 / 正计时 / 暂停 / 重新开始 / 移除）
+    // 在某个条目上右键：顶部出现针对该条目的操作
     g_menuTaskKey.clear();
+    g_menuHint = -1;
     if (fromCard) {
         POINT cp = pt;
         ScreenToClient(hwnd, &cp);
         for (const auto& row : g_rowHitRects) {
             if (!PtInRect(&row.rc, cp)) continue;
             g_menuTaskKey = row.key;
-            HMENU hTask = CreatePopupMenu();
-            HMENU hCd = CreatePopupMenu();
-            for (int i = 0; i < kTaskPresetCount; ++i) {
-                wchar_t buf[48];
-                if (kTaskPresetMinutes[i] == 25) swprintf(buf, 48, L"25 分钟（番茄钟）");
-                else if (kTaskPresetMinutes[i] % 60 == 0) swprintf(buf, 48, L"%d 小时", kTaskPresetMinutes[i] / 60);
-                else swprintf(buf, 48, L"%d 分钟", kTaskPresetMinutes[i]);
-                AppendMenuW(hCd, MF_STRING, ID_TASK_CD_FIRST + i, buf);
+            g_menuHint = row.sourceIndex;
+            LineInfo L;
+            {
+                std::vector<std::wstring> lines;
+                if (ReadTodoFileLinesW(lines)) {
+                    int idx = FindItemLine(lines, row.sourceIndex, row.key);
+                    if (idx >= 0) { L = ParseLine(lines[(size_t)idx]); g_menuHint = idx; }
+                }
             }
-            AppendMenuW(hCd, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(hCd, MF_STRING, ID_TASK_CD_CUSTOM, L"自定义…  Custom");
-            AppendMenuW(hTask, MF_POPUP, (UINT_PTR)hCd, L"倒计时  Countdown");
-            AppendMenuW(hTask, MF_STRING, ID_TASK_STOPWATCH, L"正计时  Stopwatch");
-            if (TaskTimer* t = FindTaskTimer(row.key)) {
-                AppendMenuW(hTask, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(hTask, MF_STRING, ID_TASK_PAUSE, t->start > 0 ? L"暂停  Pause" : L"继续  Resume");
-                AppendMenuW(hTask, MF_STRING, ID_TASK_RESTART, L"重新开始  Restart");
-                AppendMenuW(hTask, MF_STRING, ID_TASK_REMOVE, L"移除计时  Remove timer");
+            std::wstring name = Ellipsize(ProcessPlaceholdersW(KeyDisplayName(row.key)), 18);
+            if (name.empty()) name = IsGroupKey(row.key) ? L"未命名分组" : L"倒计时";
+            AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, name.c_str());
+
+            if (IsGroupKey(row.key)) {
+                AppendMenuW(hMenu, MF_STRING, ID_GROUP_FOLD, L.fold ? L"展开分组" : L"折叠分组");
+                AppendMenuW(hMenu, MF_STRING, ID_ITEM_HIDE, L.hide ? L"取消隐藏分组" : L"隐藏分组");
+            } else {
+                bool isCd = IsCountdownKey(row.key);
+                HMENU hQuick = CreatePopupMenu();
+                for (int i = 0; i < kTaskPresetCount; ++i) {
+                    wchar_t buf[48];
+                    if (kTaskPresetMinutes[i] % 60 == 0) swprintf(buf, 48, L"%d 小时后", kTaskPresetMinutes[i] / 60);
+                    else swprintf(buf, 48, L"%d 分钟后", kTaskPresetMinutes[i]);
+                    AppendMenuW(hQuick, MF_STRING, ID_TASK_CD_FIRST + i, buf);
+                }
+                if (isCd) {
+                    AppendMenuW(hMenu, MF_STRING, ID_TASK_DUE_SET, L"修改倒计时…");
+                    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hQuick, L"快速设定");
+                    AppendMenuW(hMenu, MF_STRING, ID_CD_DELETE, L"删除倒计时");
+                } else {
+                    AppendMenuW(hMenu, MF_STRING, ID_TASK_DUE_SET, L.hasDue ? L"修改截止时间…" : L"设置截止时间…");
+                    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hQuick, L"快速倒计时");
+                    if (L.hasDue) AppendMenuW(hMenu, MF_STRING, ID_TASK_DUE_CLEAR, L"清除截止时间");
+                    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+                    if (TaskTimer* t = FindTaskTimer(row.key)) {
+                        AppendMenuW(hMenu, MF_STRING, ID_TASK_PAUSE, t->start > 0 ? L"暂停正计时" : L"继续正计时");
+                        AppendMenuW(hMenu, MF_STRING, ID_TASK_RESTART, L"重新开始正计时");
+                        AppendMenuW(hMenu, MF_STRING, ID_TASK_REMOVE, L"移除正计时");
+                    } else {
+                        AppendMenuW(hMenu, MF_STRING, ID_TASK_STOPWATCH, L"开始正计时");
+                    }
+                }
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(hMenu, MF_STRING | (L.show ? MF_CHECKED : MF_UNCHECKED), ID_ITEM_SHOW, L"分组折叠 / 隐藏时仍显示");
+                AppendMenuW(hMenu, MF_STRING, ID_ITEM_HIDE, L.hide ? L"取消隐藏" : L"隐藏");
             }
-            std::wstring title = L"任务计时：" + Ellipsize(ProcessPlaceholdersW(row.key), 16) + L"  Timer";
-            AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hTask, title.c_str());
             AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
             break;
         }
     }
-    // 主入口：打开滑动条设置面板（粗体默认项）
-    AppendMenuW(hMenu, MF_STRING, ID_SETTINGS,     L"设置…  Settings");
-    std::wstring fontLabel = L"字体：" + (g_fontFamily.empty() ? std::wstring(L"默认") : g_fontFamily) + L"…  Font";
-    AppendMenuW(hMenu, MF_STRING, ID_FONT_SELECT, fontLabel.c_str());
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    HMENU hCountdownMenu = CreatePopupMenu();
-    AppendMenuW(hCountdownMenu, MF_STRING, ID_COUNTDOWN_1MIN, L"1 分钟");
-    AppendMenuW(hCountdownMenu, MF_STRING, ID_COUNTDOWN_5MIN, L"5 分钟");
-    AppendMenuW(hCountdownMenu, MF_STRING, ID_COUNTDOWN_10MIN, L"10 分钟");
-    AppendMenuW(hCountdownMenu, MF_STRING, ID_COUNTDOWN_1HOUR, L"1 小时");
-    AppendMenuW(hCountdownMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hCountdownMenu, MF_STRING | (g_countdownRepeatEnabled ? MF_CHECKED : MF_UNCHECKED),
-        ID_COUNTDOWN_REPEAT, L"重复计时  Repeat");
-    AppendMenuW(hCountdownMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hCountdownMenu, MF_STRING, ID_COUNTDOWN_CUSTOM, L"自定义…  Custom");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hCountdownMenu, L"倒计时  Countdown");
-    AppendMenuW(hMenu, MF_STRING, ID_ALARM_CUSTOM, L"设置闹钟…  Alarm");
-    if (g_reminderArmed) {
-        std::wstring status = GetReminderStatusText();
-        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, status.c_str());
-        if (!g_alertActive) {
-            AppendMenuW(hMenu, MF_STRING, ID_REMINDER_CANCEL, L"取消倒计时/闹钟  Cancel");
-        }
-    }
-    if (g_alertActive) {
-        AppendMenuW(hMenu, MF_STRING, ID_REMINDER_CANCEL, L"停止提醒  Stop alert");
-    }
+    AppendMenuW(hMenu, MF_STRING, ID_NEW_COUNTDOWN, L"新建倒计时…");
+    if (g_alertActive) AppendMenuW(hMenu, MF_STRING, ID_REMINDER_CANCEL, L"停止提醒");
+    AppendMenuW(hMenu, MF_STRING | (g_showHidden ? MF_CHECKED : MF_UNCHECKED), ID_SHOW_HIDDEN, L"显示隐藏的条目");
+    AppendMenuW(hMenu, MF_STRING | (g_sinkCompleted ? MF_CHECKED : MF_UNCHECKED), ID_SINK_DONE, L"已完成项沉底");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     HMENU hModeMenu = CreatePopupMenu();
-    AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 0 ? MF_CHECKED : MF_UNCHECKED),
-        ID_MODE_DESKTOP, L"附着桌面（Win+D 不最小化）  Attach to desktop");
-    AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 1 ? MF_CHECKED : MF_UNCHECKED),
-        ID_MODE_TOPMOST, L"始终置顶（Win+D 不影响）  Always on top");
+    AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 2 ? MF_CHECKED : MF_UNCHECKED), ID_MODE_SMART, L"智能浮现（推荐）");
+    AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 0 ? MF_CHECKED : MF_UNCHECKED), ID_MODE_DESKTOP, L"附着桌面");
+    AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 1 ? MF_CHECKED : MF_UNCHECKED), ID_MODE_TOPMOST, L"始终置顶");
     AppendMenuW(hModeMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED),
-        ID_HOVER_HIDE, L"置顶时鼠标悬停隐藏（按住 Ctrl 可操作）  Hide on hover when on top");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"显示模式  Display mode");
+    {
+        UINT dis = g_displayMode == 2 ? 0 : MF_GRAYED;
+        HMENU hLead = CreatePopupMenu();
+        for (int i = 0; i < 4; ++i) {
+            std::wstring t = L"提前 " + std::to_wstring(kSurfaceLeadOpts[i]) + L" 分钟";
+            AppendMenuW(hLead, MF_STRING | (g_surfaceLeadMin == kSurfaceLeadOpts[i] ? MF_CHECKED : 0), ID_SURFACE_LEAD_FIRST + i, t.c_str());
+        }
+        AppendMenuW(hModeMenu, MF_POPUP | dis, (UINT_PTR)hLead, L"临近截止时浮现");
+        HMENU hEvery = CreatePopupMenu();
+        for (int i = 0; i < 4; ++i) {
+            std::wstring t = kSurfaceEveryOpts[i] ? (L"每 " + std::to_wstring(kSurfaceEveryOpts[i]) + L" 分钟") : std::wstring(L"关闭");
+            AppendMenuW(hEvery, MF_STRING | (g_surfaceEveryMin == kSurfaceEveryOpts[i] ? MF_CHECKED : 0), ID_SURFACE_EVERY_FIRST + i, t.c_str());
+        }
+        AppendMenuW(hModeMenu, MF_POPUP | dis, (UINT_PTR)hEvery, L"定时轻浮现");
+    }
+    AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED) | (g_displayMode == 1 ? 0 : MF_GRAYED),
+        ID_HOVER_HIDE, L"置顶时悬停隐藏（按住 Ctrl 可操作）");
+    {
+        HMENU hDelayMenu = CreatePopupMenu();
+        bool on = g_hoverHideEnabled && g_displayMode == 1;
+        for (int i = 0; i < (int)(sizeof(kHoverDelayPresetsMs) / sizeof(kHoverDelayPresetsMs[0])); ++i) {
+            int ms = kHoverDelayPresetsMs[i];
+            wchar_t label[64];
+            if (ms == 0) wcscpy_s(label, L"立即");
+            else swprintf_s(label, L"%g 秒", ms / 1000.0);
+            AppendMenuW(hDelayMenu, MF_STRING | (g_hoverHideDelayMs == ms ? MF_CHECKED : MF_UNCHECKED), ID_HOVER_DELAY_FIRST + i, label);
+        }
+        AppendMenuW(hModeMenu, MF_POPUP | (on ? 0 : MF_GRAYED), (UINT_PTR)hDelayMenu, L"悬停多久后隐藏");
+    }
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"显示模式");
+    AppendMenuW(hMenu, MF_STRING, ID_SETTINGS, L"外观设置…");
+    std::wstring fontLabel = L"字体：" + (g_fontFamily.empty() ? std::wstring(L"默认") : g_fontFamily) + L"…";
+    AppendMenuW(hMenu, MF_STRING, ID_FONT_SELECT, fontLabel.c_str());
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EDIT,    L"编辑 TODO  Edit");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_REFRESH, L"刷新  Refresh");
-    AppendMenuW(hMenu, MF_STRING, ID_TODO_CHANGE,  L"更换 TODO 文件  Change file");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EDIT,    L"编辑 TODO");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_REFRESH, L"刷新");
+    AppendMenuW(hMenu, MF_STRING, ID_TODO_CHANGE,  L"更换 TODO 文件…");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT,    L"退出  Exit");
-    SetMenuDefaultItem(hMenu, ID_SETTINGS, FALSE);
-  
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT,    L"退出");
+
     // 显示菜单（弹出期间暂停悬停隐藏，避免菜单还开着卡片就消失）
     g_contextMenuOpen = true;
     TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
@@ -1950,6 +2650,13 @@ void confWrite() {
     ofs << "DisplayMode: " << g_displayMode << std::endl;
     ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
     ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+    ofs << "HoverHideDelay: " << g_hoverHideDelayMs << std::endl;
+    ofs << "SurfaceLead: " << g_surfaceLeadMin << std::endl;
+    ofs << "SurfaceEvery: " << g_surfaceEveryMin << std::endl;
+    ofs << "ShowHidden: " << (g_showHidden ? 1 : 0) << std::endl;
+    ofs << "SinkCompleted: " << (g_sinkCompleted ? 1 : 0) << std::endl;
+    ofs << "DueDisplay: " << (g_dueShowAbsolute ? 1 : 0) << std::endl;
+    ofs << "DueInputMode: " << g_dueInputMode << std::endl;
 }
 
 // 简单的窗口过程，用于绘制文本
@@ -1985,17 +2692,35 @@ static void RoundRectPath(Gdiplus::GraphicsPath& p,
 }
 
 
-enum TipRowType { RT_SPACER, RT_HEADING, RT_META, RT_TODO };
+enum TipRowType { RT_SPACER, RT_HEADING, RT_META, RT_TODO, RT_COUNTDOWN, RT_GROUP };
 struct TipRow {
-    TipRowType type;
+    TipRowType type = RT_SPACER;
     std::wstring text;
-    float w;
-    float tw;          // 纯文字宽度（删除线动画用）
-    float h;
-    float y;
-    int sourceIndex;
-    bool completed;
-    std::wstring key;  // 待办的原始文本（计时器的键）
+    float w = 0;
+    float tw = 0;          // 纯文字宽度（删除线动画用）
+    float h = 0;
+    float y = 0;
+    int sourceIndex = -1;
+    bool completed = false;
+    std::wstring key;      // 条目键（计时器 / 菜单 / 提醒都用它）
+    int seg = 0;           // 所在段（分组），已完成项只在段内沉底
+    int depth = 0;         // 嵌套深度（用于缩进）
+    double fade = 1.0;     // 隐藏项在「显示隐藏的条目」时淡显
+    bool hasDue = false;
+    long long due = 0;
+    // 分组
+    bool folded = false;
+    int openCount = 0;     // 折叠时：未完成的待办数量
+    long long nearestDue = 0;
+    std::wstring summary;  // 折叠时右侧的摘要
+    // 计时胶囊
+    bool pill = false;
+    bool pillDue = false;  // true = 截止时间，false = 正计时
+    bool pillRunning = true;
+    bool pillExpired = false;
+    double pillFrac = 0.0;
+    int pillTone = 0;      // 0 = 常态，1 = 快到点，2 = 已到点 / 超时，3 = 正计时
+    std::wstring pillLabel;
 };
 
 static const double ANIM_PI = 3.14159265358979323846;
@@ -2018,13 +2743,17 @@ static Gdiplus::Color WithAlpha(const Gdiplus::Color& c, double a)
 {
     return Gdiplus::Color((BYTE)ClampByte(a), c.GetR(), c.GetG(), c.GetB());
 }
+static Gdiplus::Color Faded(const Gdiplus::Color& c, double f)
+{
+    return Gdiplus::Color((BYTE)ClampByte(c.GetA() * f), c.GetR(), c.GetG(), c.GetB());
+}
 
 // 对勾（按路径长度比例 t 逐步描绘）
 static void DrawTick(Gdiplus::Graphics& g, float x, float y, float d, double t, const Gdiplus::Color& c, float width)
 {
     using namespace Gdiplus;
     if (t <= 0.0) return;
-    PointF p0(x + d * 0.23f, y + d * 0.53f), p1(x + d * 0.43f, y + d * 0.72f), p2(x + d * 0.78f, y + d * 0.28f);
+    PointF p0(x + d * 0.27f, y + d * 0.52f), p1(x + d * 0.44f, y + d * 0.68f), p2(x + d * 0.74f, y + d * 0.34f);
     double l1 = std::hypot(p1.X - p0.X, p1.Y - p0.Y), l2 = std::hypot(p2.X - p1.X, p2.Y - p1.Y);
     double len = (l1 + l2) * Clamp01(t);
     Pen pen(c, width);
@@ -2041,6 +2770,13 @@ static void DrawTick(Gdiplus::Graphics& g, float x, float y, float d, double t, 
     }
 }
 
+// 把数字替换成 8，用来按「最宽数字」测量，计时数字跳动时胶囊宽度不抖
+static std::wstring DigitsTo8(std::wstring s)
+{
+    for (auto& ch : s) if (ch >= L'0' && ch <= L'9') ch = L'8';
+    return s;
+}
+
 // 阴影位图缓存：高斯模糊是渲染里最贵的一步，尺寸不变时复用（计时/动画需要频繁重绘）
 static Gdiplus::Bitmap* g_shadowCache = nullptr;
 static int g_shadowKey[6] = { 0 };
@@ -2050,7 +2786,9 @@ void RenderTip(HWND hwnd)
     using namespace Gdiplus;
 
     if (!g_taskTimersLoaded) LoadTaskTimers();
+    if (!g_dueMetaLoaded) LoadDueMeta();
     auto nowSteady = steady_clock::now();
+    long long nowE = NowEpoch();
     double alertT = g_alertActive ? duration<double>(nowSteady - g_alertStarted).count() : 0.0;
     double pulse = g_alertActive ? 0.5 + 0.5 * std::sin(alertT * 2.0 * ANIM_PI / 1.4) : 0.0;
 
@@ -2059,37 +2797,40 @@ void RenderTip(HWND hwnd)
     bool fileOk = ReadTodoFileLinesW(raw);
     if (!fileOk) raw.push_back(L"Error: Unable to open file!");
 
-    // ---- 基础尺寸（由配置的字号驱动，托盘的字号/行距按钮依然有效）----
+    // ---- 基础尺寸（由配置的字号驱动）----
     float base   = (float)(fontHeight > 8 ? fontHeight : 24); // 待办文字像素高
     float headSz = base * 2.0f;   // 时钟/标题
     float metaSz = base * 0.64f;  // 日期/页脚
+    float groupSz = base * 0.66f; // 分组标题
 
     int PADX    = (int)(base * 1.15f);
     int PADTOP  = (int)(base * 0.95f);
     int PADBOT  = (int)(base * 1.05f);
-    int checkD  = (int)(base * 0.58f); if (checkD < 11) checkD = 11;
-    int checkGap = (int)(base * 0.52f);
+    int checkD  = (int)(base * 0.62f); if (checkD < 12) checkD = 12;
+    int checkGap = (int)(base * 0.50f);
     int divGap  = (int)(base * 0.80f);
     int metaGap = (int)(base * 0.28f);
     int headGap = (int)(base * 0.12f);
+    int groupGapTop = (int)(base * 0.62f);
+    int groupGapBot = (int)(base * 0.30f);
     int todoExtra = lineHeight - fontHeight; if (todoExtra < 0) todoExtra = 0;
     int todoGap = (int)(base * 0.45f) + todoExtra;
     int M       = (int)(base * 2.10f); // 阴影外扩边距（需 > 模糊半径）
+    float indentStep = base * 0.95f;   // 子分组每深一级的缩进
     float radius = base * 0.70f;
-
-    // 卡片背景由 g_bgAlpha / g_bgColor 控制（可在托盘菜单调整）
 
     FontFamily* famText = PickFamily({ g_fontFamily.c_str(), L"Microsoft YaHei UI", L"Microsoft YaHei", L"微软雅黑" });
     FontFamily* famHead = PickFamily({ g_fontFamily.c_str(), L"Microsoft YaHei Light", L"Microsoft YaHei UI Light", L"Microsoft YaHei UI", L"Microsoft YaHei" });
-    FontFamily* famNum  = PickFamily({ L"Segoe UI", L"Microsoft YaHei UI", L"Arial" });   // 等宽数字，计时不跳动
+    FontFamily* famNum  = PickFamily({ L"Segoe UI", L"Microsoft YaHei UI", L"Arial" });   // 数字字形，计时不跳动
     Font fHead(famHead, headSz, FontStyleRegular, UnitPixel);
     Font fText(famText, base,   FontStyleRegular, UnitPixel);
     Font fTextDone(famText, base, FontStyleStrikeout, UnitPixel);
     Font fMeta(famText, metaSz, FontStyleRegular, UnitPixel);
-    Font fTimer(famNum, base * 0.66f, FontStyleRegular, UnitPixel);
-    Font fBTitle(famText, base * 0.88f, FontStyleBold, UnitPixel);
-    Font fBDetail(famText, base * 0.64f, FontStyleRegular, UnitPixel);
-    Font fBtn(famText, base * 0.58f, FontStyleBold, UnitPixel);
+    Font fGroup(famText, groupSz, FontStyleBold, UnitPixel);
+    Font fTimer(famNum, base * 0.64f, FontStyleRegular, UnitPixel);
+    Font fBTitle(famText, base * 0.84f, FontStyleBold, UnitPixel);
+    Font fBDetail(famText, base * 0.62f, FontStyleRegular, UnitPixel);
+    Font fBtn(famText, base * 0.58f, FontStyleRegular, UnitPixel);
 
     StringFormat fmt(StringFormat::GenericTypographic());
     fmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
@@ -2098,55 +2839,117 @@ void RenderTip(HWND hwnd)
     Graphics mg(screen);
     mg.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 
-    // ---- 构建行模型 ----
+    // ---- 构建行模型：多级分组 / 折叠 / 隐藏 / _SHOW ----
     std::vector<TipRow> rows;
     rows.reserve(raw.size());
-    for (size_t i = 0; i < raw.size(); ++i) {
-        std::wstring s2 = raw[i];
-        TrimLineRight(s2);
-        size_t b = 0; while (b < s2.size() && (s2[b] == L' ' || s2[b] == L'\t')) b++;
-        std::wstring t = s2.substr(b);
+    {
+        struct GroupFrame { int level; int row; bool hidden; bool folded; double fade; };
+        std::vector<GroupFrame> stack;
+        int seg = 0;
+        auto popTo = [&](int level) { while (!stack.empty() && stack.back().level >= level) stack.pop_back(); };
+        for (size_t i = 0; i < raw.size(); ++i) {
+            TipRow r;
+            r.sourceIndex = fileOk ? (int)i : -1;
+            if (!fileOk) { r.type = RT_META; r.text = raw[i]; rows.push_back(r); continue; }
+            LineInfo L = ParseLine(raw[i]);
+            if (L.kind == LK_GROUP_END) { popTo(L.level); seg++; continue; }
+            if (L.kind == LK_HEADING) { stack.clear(); seg++; }
 
-        TipRow r;
-        r.w = 0;
-        r.tw = 0;
-        r.h = 0;
-        r.y = 0;
-        r.sourceIndex = fileOk ? (int)i : -1;
-        r.completed = false;
+            // 祖先分组的状态
+            bool ancHidden = false, ancFolded = false;
+            double ancFade = 1.0;
+            int summaryRow = -1;   // 最外层、标题可见的折叠分组：被折叠的条目计入它的摘要
+            for (const auto& f : stack) {
+                if (f.hidden) ancHidden = true;
+                if (f.folded) { if (!ancFolded && !ancHidden && f.row >= 0) summaryRow = f.row; ancFolded = true; }
+                ancFade *= f.fade;
+            }
+            bool ancBlocked = (ancHidden && !g_showHidden) || ancFolded;
 
-        if (t.empty()) {
-            r.type = RT_SPACER;
-            r.text = L"";
-        } else if (t[0] == L'#') {
-            r.type = RT_HEADING;
-            r.text = ProcessPlaceholdersW((t.size() > 1 && t[1] == L' ') ? t.substr(2) : t.substr(1));
-        } else if (t[0] == L'>') {
-            r.type = RT_META;
-            r.text = ProcessPlaceholdersW((t.size() > 1 && t[1] == L' ') ? t.substr(2) : t.substr(1));
-        } else {
-            std::wstring todoText;
-            bool completed = false;
-            ParseTodoLineState(raw[i], &todoText, &completed);
-            r.type = fileOk ? RT_TODO : RT_META;
-            r.text = ProcessPlaceholdersW(todoText.empty() && !fileOk ? raw[i] : todoText);
-            r.completed = completed;
-            r.key = TrimCopy(todoText);
+            if (L.kind == LK_GROUP) {
+                popTo(L.level);
+                // 重新计算（弹栈后祖先可能变了）
+                ancHidden = ancFolded = false; ancFade = 1.0; summaryRow = -1;
+                for (const auto& f : stack) {
+                    if (f.hidden) ancHidden = true;
+                    if (f.folded) { if (!ancFolded && !ancHidden && f.row >= 0) summaryRow = f.row; ancFolded = true; }
+                    ancFade *= f.fade;
+                }
+                ancBlocked = (ancHidden && !g_showHidden) || ancFolded;
+                seg++;
+                GroupFrame fr = { L.level, -1, L.hide, L.fold, L.hide ? 0.42 : 1.0 };
+                bool visible = !ancBlocked && !(L.hide && !g_showHidden);
+                if (visible) {
+                    r.type = RT_GROUP;
+                    r.text = ProcessPlaceholdersW(L.text);
+                    if (r.text.empty()) r.text = L"未命名分组";
+                    r.key = ItemKey(L);
+                    r.folded = L.fold;
+                    r.fade = ancFade * fr.fade;
+                    r.seg = seg;
+                    r.depth = (int)stack.size();
+                    rows.push_back(r);
+                    fr.row = (int)rows.size() - 1;
+                }
+                stack.push_back(fr);
+                continue;
+            }
+
+            bool isItem = (L.kind == LK_TODO || L.kind == LK_COUNTDOWN);
+            bool selfHidden = L.hide && !g_showHidden;
+            // _SHOW：所在分组折叠或隐藏时，这一条仍显示（自身带 _HIDE 时除外）
+            bool pinned = isItem && L.show && !selfHidden;
+            if ((ancBlocked && !pinned) || selfHidden) {
+                if (ancFolded && summaryRow >= 0 && isItem && !L.ok && !L.hide) {
+                    TipRow& gr = rows[(size_t)summaryRow];
+                    if (L.kind == LK_TODO) gr.openCount++;
+                    if (L.hasDue && (gr.nearestDue == 0 || L.due < gr.nearestDue)) gr.nearestDue = L.due;
+                }
+                continue;
+            }
+            r.seg = seg;
+            r.depth = (int)stack.size();
+            r.fade = (pinned && ancBlocked ? 1.0 : ancFade) * (L.hide ? 0.42 : 1.0);
+            switch (L.kind) {
+            case LK_BLANK: r.type = RT_SPACER; break;
+            case LK_HEADING: r.type = RT_HEADING; r.text = ProcessPlaceholdersW(L.text); r.depth = 0; break;
+            case LK_META: r.type = RT_META; r.text = ProcessPlaceholdersW(L.text); break;
+            case LK_COUNTDOWN:
+                r.type = RT_COUNTDOWN;
+                r.text = ProcessPlaceholdersW(TrimCopy(L.text));
+                if (r.text.empty()) r.text = L"倒计时";
+                r.key = ItemKey(L);
+                r.completed = L.ok;
+                r.hasDue = true; r.due = L.due;
+                break;
+            default:
+                r.type = RT_TODO;
+                r.text = ProcessPlaceholdersW(L.text);
+                r.key = ItemKey(L);
+                r.completed = L.ok;
+                r.hasDue = L.hasDue; r.due = L.due;
+                break;
+            }
+            rows.push_back(r);
         }
-        rows.push_back(r);
     }
 
-    std::vector<TipRow> todos;
-    for (const auto& r : rows) {
-        if (r.type == RT_TODO) todos.push_back(r);
-    }
-    std::stable_sort(todos.begin(), todos.end(), [](const TipRow& a, const TipRow& b) {
-        return a.completed < b.completed;
-    });
-    size_t nextTodo = 0;
-    for (auto& r : rows) {
-        if (r.type == RT_TODO && nextTodo < todos.size()) {
-            r = todos[nextTodo++];
+    // 开启「已完成项沉底」时：已完成排在后面（只在同一段内，与文件内的排序一致，容错手工编辑）
+    if (g_sinkCompleted) {
+
+        std::unordered_map<int, std::vector<size_t>> slotsBySeg;
+        std::vector<int> segOrder;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].type != RT_TODO) continue;
+            if (!slotsBySeg.count(rows[i].seg)) segOrder.push_back(rows[i].seg);
+            slotsBySeg[rows[i].seg].push_back(i);
+        }
+        for (int sg : segOrder) {
+            auto& slots = slotsBySeg[sg];
+            std::vector<TipRow> todos;
+            for (size_t ix : slots) todos.push_back(rows[ix]);
+            std::stable_sort(todos.begin(), todos.end(), [](const TipRow& a, const TipRow& b) { return a.completed < b.completed; });
+            for (size_t n = 0; n < slots.size(); ++n) rows[slots[n]] = todos[n];
         }
     }
 
@@ -2157,39 +2960,72 @@ void RenderTip(HWND hwnd)
         return bb;
     };
 
-    // ---- 计时胶囊尺寸：同一列右对齐，宽度按模板测量，数字变化时不抖动 ----
-    float pillH = base * 1.08f;
-    float ringD = pillH * 0.56f;
-    float pillPadX = base * 0.40f;
-    float pillInnerGap = base * 0.30f;
+    // ---- 计时胶囊内容（截止时间优先；任务完成后只保留正计时的最终用时）----
+    float pillH = base * 1.0f;
+    float ringD = base * 0.62f;
+    float pillPadX = base * 0.34f;
+    float pillInnerGap = base * 0.28f;
     float pillGap = base * 0.75f;
     float pillColW = 0.0f;
-    for (const auto& r : rows) {
-        if (r.type != RT_TODO) continue;
-        TaskTimer* t = FindTaskTimer(r.key);
-        if (!t) continue;
-        long long el = TimerElapsed(*t);
-        long long span = t->countdown ? (std::max)(t->duration, el - t->duration) : el;
-        RectF bb = measure(span >= 3600 ? L"+88:88:88" : L"+88:88", fTimer);
-        float w = pillPadX * 2 + ringD + pillInnerGap + bb.Width;
-        if (w > pillColW) pillColW = w;
+    g_hasDuePill = false;
+    auto dueLabel = [&](long long due) -> std::wstring {
+        long long rem = due - nowE;
+        if (g_dueShowAbsolute) return FormatDueShort(due);
+        return rem > 0 ? FormatRemain(rem) : L"+" + FormatRemain(-rem);
+    };
+    for (auto& r : rows) {
+        if (r.type == RT_GROUP && r.folded) {
+            std::wstring s;
+            if (r.openCount > 0) s = std::to_wstring(r.openCount) + L" 项";
+            if (r.nearestDue > 0) { s += (s.empty() ? L"" : L"  ·  ") + dueLabel(r.nearestDue); g_hasDuePill = true; }
+            r.summary = s;
+            continue;
+        }
+        if (r.type != RT_TODO && r.type != RT_COUNTDOWN) continue;
+        if (r.hasDue && !r.completed) {
+            long long rem = r.due - nowE;
+            long long setAt = DueSetAt(r.key, r.due);
+            long long total = (setAt > 0 && r.due > setAt) ? r.due - setAt : 0;
+            r.pill = true; r.pillDue = true; r.pillRunning = true;
+            r.pillExpired = rem <= 0;
+            r.pillFrac = rem <= 0 ? 1.0 : (total > 0 ? Clamp01((double)rem / (double)total) : 1.0);
+            r.pillTone = rem <= 0 ? 2 : ((rem <= 60 || (total > 0 && rem * 5 <= total)
+                || (g_displayMode == 2 && rem <= (long long)g_surfaceLeadMin * 60)) ? 1 : 0);
+            r.pillLabel = dueLabel(r.due);
+            g_hasDuePill = true;
+        } else if (r.type == RT_TODO) {
+            TaskTimer* t = FindTaskTimer(r.key);
+            if (!t) continue;
+            long long el = TimerElapsed(*t);
+            r.pill = true; r.pillDue = false; r.pillRunning = t->start > 0;
+            r.pillFrac = (double)(el % 60) / 60.0;
+            r.pillTone = 3;
+            r.pillLabel = FormatClock(el);
+        }
+        if (r.pill) {
+            float w = pillPadX * 2 + ringD + pillInnerGap + measure(DigitsTo8(r.pillLabel), fTimer).Width;
+            if (w > pillColW) pillColW = w;
+        }
     }
 
     // ---- 第一遍：测量 + 计算布局 ----
     float contentW = base * 4.0f;
     for (auto& r : rows) {
         if (r.type == RT_SPACER) { r.h = base * 0.45f; continue; }
-        Font* f = (r.type == RT_HEADING) ? &fHead : (r.type == RT_META) ? &fMeta : &fText;
+        Font* f = (r.type == RT_HEADING) ? &fHead : (r.type == RT_META) ? &fMeta : (r.type == RT_GROUP) ? &fGroup : &fText;
         RectF bb = measure(r.text, *f);
         r.h = bb.Height;
         r.tw = bb.Width;
-        r.w = bb.Width + (r.type == RT_TODO ? (float)(checkD + checkGap) : 0.0f);
-        if (r.type == RT_TODO && pillColW > 0 && FindTaskTimer(r.key)) r.w += pillGap + pillColW;
+        r.w = bb.Width;
+        if (r.type == RT_TODO || r.type == RT_COUNTDOWN || r.type == RT_GROUP) r.w += (float)(checkD + checkGap);
+        r.w += r.depth * indentStep;
+        if (r.pill) r.w += pillGap + pillColW;
+        if (r.type == RT_GROUP && !r.summary.empty()) r.w += pillGap + measure(DigitsTo8(r.summary), fMeta).Width;
         if (r.w > contentW) contentW = r.w;
     }
 
     // ---- 提醒横幅尺寸 ----
-    float bPad = base * 0.62f, iconD = base * 1.5f, btnH = base * 1.25f, btnPadX = base * 0.72f, btnGap = base * 0.36f;
+    float bPad = base * 0.60f, iconD = base * 1.30f, btnH = base * 1.15f, btnPadX = base * 0.70f, btnGap = base * 0.30f;
     float bannerH = 0.0f, bTitleH = 0.0f, bDetailH = 0.0f, bHeadBlock = 0.0f;
     auto btnSpec = BannerButtonSpec();
     std::vector<float> btnW;
@@ -2205,8 +3041,8 @@ void RenderTip(HWND hwnd)
         }
         btnsW += btnGap * (float)(btnSpec.size() - 1);
         float need = (std::max)(bPad + iconD + bPad * 0.8f + textW + bPad, bPad * 2 + btnsW);
-        bHeadBlock = (std::max)(iconD, bTitleH + base * 0.12f + bDetailH);
-        bannerH = bPad + bHeadBlock + base * 0.6f + btnH + bPad;
+        bHeadBlock = (std::max)(iconD, bTitleH + base * 0.10f + bDetailH);
+        bannerH = bPad + bHeadBlock + base * 0.55f + btnH + bPad;
         if (need > contentW) contentW = need;
     }
 
@@ -2214,19 +3050,24 @@ void RenderTip(HWND hwnd)
     float bannerY = y;
     if (g_alertActive) y += bannerH + base * 0.85f;
     float dividerY = -1.0f;
-    bool placedDivider = false, seenContent = g_alertActive;
+    bool placedDivider = false, seenContent = g_alertActive, seenList = false;
     float lastGap = 0.0f;
     for (auto& r : rows) {
         if (r.type == RT_SPACER) { y += r.h; lastGap = 0; continue; }
-        if (r.type == RT_TODO && !placedDivider) {
+        bool listRow = (r.type == RT_TODO || r.type == RT_COUNTDOWN || r.type == RT_GROUP);
+        if (listRow && !placedDivider) {
             if (seenContent) { y += divGap; dividerY = y; y += 1 + divGap; }
             placedDivider = true;
+        } else if (r.type == RT_GROUP && seenList) {
+            y += groupGapTop - lastGap * 0.5f;
         }
         r.y = y;
         if (r.type == RT_HEADING) { y += r.h + headGap; lastGap = (float)headGap; }
         else if (r.type == RT_META) { y += r.h + metaGap; lastGap = (float)metaGap; }
+        else if (r.type == RT_GROUP) { y += r.h + groupGapBot; lastGap = (float)groupGapBot; }
         else { float rh = (r.h > checkD ? r.h : (float)checkD); y += rh + todoGap; lastGap = (float)todoGap; }
         seenContent = true;
+        if (listRow) seenList = true;
     }
     y -= lastGap;
     int cardW = (int)(contentW + PADX * 2 + 0.5f);
@@ -2271,7 +3112,7 @@ void RenderTip(HWND hwnd)
             sg.SetSmoothingMode(SmoothingModeAntiAlias);
             GraphicsPath sp;
             RoundRectPath(sp, (float)M, (float)M + shDy, (float)cardW, (float)cardH, radius);
-            SolidBrush sb(Color(130, 0, 0, 0));
+            SolidBrush sb(Color(120, 0, 0, 0));
             sg.FillPath(&sb, &sp);
             Blur blur;
             BlurParams bp; bp.radius = blurR; bp.expandEdge = FALSE;
@@ -2288,33 +3129,39 @@ void RenderTip(HWND hwnd)
         g.DrawImage(g_shadowCache, 0, 0);
     }
 
-    // 卡片底 + 发丝描边
+    // 卡片底 + 顶部微光 + 发丝描边
     GraphicsPath cp;
     RoundRectPath(cp, (float)M, (float)M, (float)cardW, (float)cardH, radius);
     SolidBrush cardBrush(Color((BYTE)g_bgAlpha, GetRValue(g_bgColor), GetGValue(g_bgColor), GetBValue(g_bgColor)));
     g.FillPath(&cardBrush, &cp);
-    Pen border(Color(24, 255, 255, 255), 1.0f);
+    {
+        LinearGradientBrush sheen(PointF(0, (REAL)M), PointF(0, (REAL)(M + cardH * 0.55f)),
+            Color(16, 255, 255, 255), Color(0, 255, 255, 255));
+        g.FillPath(&sheen, &cp);
+    }
+    Pen border(Color(26, 255, 255, 255), 1.0f);
     g.DrawPath(&border, &cp);
 
     // 提醒中：卡片边缘呼吸光
     if (g_alertActive) {
         for (int k = 3; k >= 1; --k) {
-            Pen gp(Color((BYTE)ClampByte((22.0 + 34.0 * pulse) * (4 - k) / 3.0), 255, 107, 107), (REAL)(k * 2.2f));
+            Pen gp(Color((BYTE)ClampByte((18.0 + 30.0 * pulse) * (4 - k) / 3.0), 255, 107, 107), (REAL)(k * 2.2f));
             g.DrawPath(&gp, &cp);
         }
-        Pen bp(Color((BYTE)ClampByte(110.0 + 120.0 * pulse), 255, 128, 112), 1.6f);
+        Pen bp(Color((BYTE)ClampByte(90.0 + 110.0 * pulse), 255, 128, 112), 1.4f);
         g.DrawPath(&bp, &cp);
     }
 
     // 颜色
     BYTE TR = GetRValue(g_textColor), TG = GetGValue(g_textColor), TB = GetBValue(g_textColor);
     Color ink(255, TR, TG, TB);
-    Color checkc(235, TR, TG, TB);
-    Color doneInk(155, ClampByte(TR * 0.55), ClampByte(TG * 0.55), ClampByte(TB * 0.55));
-    Color doneCheck(165, ClampByte(TR * 0.52), ClampByte(TG * 0.52), ClampByte(TB * 0.52));
-    Color doneFill(36, ClampByte(TR * 0.45), ClampByte(TG * 0.45), ClampByte(TB * 0.45));
-    Color meta(255, 169, 175, 189);
-    Color shadowc(90, 0, 0, 0);
+    Color checkc(200, TR, TG, TB);
+    Color doneInk(150, ClampByte(TR * 0.62), ClampByte(TG * 0.62), ClampByte(TB * 0.62));
+    Color doneCheck(150, ClampByte(TR * 0.58), ClampByte(TG * 0.58), ClampByte(TB * 0.58));
+    Color doneFill(40, ClampByte(TR * 0.50), ClampByte(TG * 0.50), ClampByte(TB * 0.50));
+    Color meta(255, 160, 167, 182);
+    Color groupInk = LerpColor(meta, ink, 0.30);
+    Color shadowc(80, 0, 0, 0);
     Color accentDone(255, 52, 211, 153);    // 完成：翡翠绿
     Color accentGold(255, 253, 224, 71);
     Color coral(255, 255, 107, 107);        // 到点：珊瑚红
@@ -2322,6 +3169,7 @@ void RenderTip(HWND hwnd)
     Color sky(255, 125, 211, 252);          // 倒计时：天蓝
     Color violet(255, 196, 181, 253);       // 正计时：淡紫
     float sdy = base * 0.045f; if (sdy < 1) sdy = 1;
+    float stroke = base * 0.058f; if (stroke < 1.2f) stroke = 1.2f;
 
     auto drawText = [&](const std::wstring& str, Font& f, float tx, float ty, Color c) {
         if (str.empty()) return;
@@ -2330,73 +3178,60 @@ void RenderTip(HWND hwnd)
         SolidBrush br(c);
         g.DrawString(str.c_str(), (INT)str.size(), &f, PointF(tx, ty), &fmt, &br);
     };
+    auto toneColor = [&](int tone) -> Color {
+        return tone == 2 ? coral : tone == 1 ? amber : tone == 3 ? violet : sky;
+    };
 
     float bx = (float)(M + PADX);
     float rightX = (float)(M + cardW - PADX);
     if (dividerY >= 0) {
-        Pen dp(Color(30, 255, 255, 255), 1.0f);
+        LinearGradientBrush dg(PointF(bx, 0), PointF(rightX, 0), Color(34, 255, 255, 255), Color(0, 255, 255, 255));
         float dyv = M + dividerY;
-        g.DrawLine(&dp, bx, dyv, rightX, dyv);
+        g.FillRectangle(&dg, bx, dyv, rightX - bx, 1.0f);
     }
 
-    // ---- 提醒横幅 ----
+    // ---- 提醒横幅：卡片色调的玻璃面板 + 珊瑚色描边 ----
     g_bannerButtons.clear();
     if (g_alertActive) {
         double e = EaseOutCubic(alertT / 0.38);              // 入场：下滑 + 淡入
         double A = 255.0 * e;
         float bw = rightX - bx;
         float byT = M + bannerY - (float)((1.0 - e) * base * 0.6);
-        float br = base * 0.55f;
-        for (int k = 1; k <= 3; ++k) {                         // 外圈呼吸光
-            GraphicsPath gp2;
-            RoundRectPath(gp2, bx - k * 1.6f, byT - k * 1.6f, bw + k * 3.2f, bannerH + k * 3.2f, br + k * 1.6f);
-            Pen pp(Color((BYTE)ClampByte(e * (40.0 + 60.0 * pulse) / k), 255, 120, 100), 1.6f);
-            g.DrawPath(&pp, &gp2);
-        }
+        float br = base * 0.50f;
         GraphicsPath bpth;
         RoundRectPath(bpth, bx, byT, bw, bannerH, br);
-        LinearGradientBrush lg(PointF(bx, byT), PointF(bx + bw, byT + bannerH),
-            Color((BYTE)ClampByte(A * 0.96), 255, 95, 109), Color((BYTE)ClampByte(A * 0.96), 255, 166, 77));
-        g.FillPath(&lg, &bpth);
-        {
-            GraphicsPath hp;
-            RoundRectPath(hp, bx + 1, byT + 1, bw - 2, bannerH - 2, br - 1);
-            Pen hpen(Color((BYTE)ClampByte(A * 0.25), 255, 255, 255), 1.0f);
-            g.DrawPath(&hpen, &hp);
-        }
+        SolidBrush bfillBg(Color((BYTE)ClampByte(A * (0.10 + 0.05 * pulse)), 255, 107, 107));
+        g.FillPath(&bfillBg, &bpth);
+        Pen bpen(Color((BYTE)ClampByte(A * (0.45 + 0.25 * pulse)), 255, 128, 112), 1.2f);
+        g.DrawPath(&bpen, &bpth);
 
-        // 闹钟图标（抖动时轻轻摇摆）
+        // 图标：细线圆环 + 指针（抖动时轻轻摇摆）
         float icx = bx + bPad + iconD / 2, icy = byT + bPad + bHeadBlock / 2;
         double wig = 0.0;
         if (g_shaking) {
             double st = duration<double>(nowSteady - g_shakeStart).count();
-            wig = 18.0 * std::sin(st * 2.0 * ANIM_PI * 6.0) * (1.0 - Clamp01(st / SHAKE_SEC));
+            wig = 16.0 * std::sin(st * 2.0 * ANIM_PI * 6.0) * (1.0 - Clamp01(st / SHAKE_SEC));
         }
         GraphicsState gs = g.Save();
         g.TranslateTransform(icx, icy);
         g.RotateTransform((REAL)wig);
-        SolidBrush icBg(Color((BYTE)ClampByte(A * 0.24), 255, 255, 255));
+        SolidBrush icBg(Color((BYTE)ClampByte(A * 0.18), 255, 107, 107));
         g.FillEllipse(&icBg, -iconD / 2, -iconD / 2, iconD, iconD);
-        float cr = iconD * 0.25f, sw = (std::max)(1.4f, base * 0.075f), cyo = iconD * 0.05f;
-        Pen wp(Color((BYTE)ClampByte(A), 255, 255, 255), sw);
+        float cr = iconD * 0.26f, sw = (std::max)(1.3f, base * 0.065f);
+        Pen wp(Color((BYTE)ClampByte(A), 255, 150, 140), sw);
         wp.SetStartCap(LineCapRound);
         wp.SetEndCap(LineCapRound);
-        g.DrawEllipse(&wp, -cr, cyo - cr, cr * 2, cr * 2);
-        g.DrawLine(&wp, 0.0f, cyo, 0.0f, cyo - cr * 0.55f);
-        g.DrawLine(&wp, 0.0f, cyo, cr * 0.42f, cyo + cr * 0.22f);
-        float er = cr * 0.48f;
-        g.DrawArc(&wp, -cr * 0.85f - er, cyo - cr * 0.95f - er, er * 2, er * 2, 190, 100);
-        g.DrawArc(&wp, cr * 0.85f - er, cyo - cr * 0.95f - er, er * 2, er * 2, 250, 100);
-        g.DrawLine(&wp, -cr * 0.62f, cyo + cr * 0.86f, -cr * 0.86f, cyo + cr * 1.14f);
-        g.DrawLine(&wp, cr * 0.62f, cyo + cr * 0.86f, cr * 0.86f, cyo + cr * 1.14f);
+        g.DrawEllipse(&wp, -cr, -cr, cr * 2, cr * 2);
+        g.DrawLine(&wp, 0.0f, 0.0f, 0.0f, -cr * 0.58f);
+        g.DrawLine(&wp, 0.0f, 0.0f, cr * 0.42f, cr * 0.24f);
         g.Restore(gs);
 
         float tx = bx + bPad + iconD + bPad * 0.8f;
-        float ty = byT + bPad + (bHeadBlock - (bTitleH + base * 0.12f + bDetailH)) / 2;
-        SolidBrush tbr(Color((BYTE)ClampByte(A), 255, 255, 255));
+        float ty = byT + bPad + (bHeadBlock - (bTitleH + base * 0.10f + bDetailH)) / 2;
+        SolidBrush tbr(WithAlpha(ink, A));
         g.DrawString(g_alertTitle.c_str(), (INT)g_alertTitle.size(), &fBTitle, PointF(tx, ty), &fmt, &tbr);
-        SolidBrush dbr(Color((BYTE)ClampByte(A * 0.88), 255, 255, 255));
-        g.DrawString(g_alertDetail.c_str(), (INT)g_alertDetail.size(), &fBDetail, PointF(tx, ty + bTitleH + base * 0.12f), &fmt, &dbr);
+        SolidBrush dbr(WithAlpha(meta, A * 0.95));
+        g.DrawString(g_alertDetail.c_str(), (INT)g_alertDetail.size(), &fBDetail, PointF(tx, ty + bTitleH + base * 0.10f), &fmt, &dbr);
 
         // 按钮（右对齐；第一个为主按钮）
         float byB = byT + bannerH - bPad - btnH;
@@ -2406,11 +3241,11 @@ void RenderTip(HWND hwnd)
             bool primary = (i == 0);
             GraphicsPath bpp;
             RoundRectPath(bpp, cx, byB, btnW[(size_t)i], btnH, btnH / 2);
-            SolidBrush bfill(primary ? Color((BYTE)ClampByte(A * 0.96), 255, 255, 255) : Color((BYTE)ClampByte(A * 0.22), 255, 255, 255));
+            SolidBrush bfill(primary ? Color((BYTE)ClampByte(A * 0.92), 255, 107, 107) : Color((BYTE)ClampByte(A * 0.10), TR, TG, TB));
             g.FillPath(&bfill, &bpp);
             const std::wstring& label = btnSpec[(size_t)i].second;
             RectF lb = measure(label, fBtn);
-            SolidBrush lbr(primary ? Color((BYTE)ClampByte(A), 225, 72, 82) : Color((BYTE)ClampByte(A), 255, 255, 255));
+            SolidBrush lbr(primary ? Color((BYTE)ClampByte(A), 255, 255, 255) : WithAlpha(ink, A * 0.9));
             g.DrawString(label.c_str(), (INT)label.size(), &fBtn,
                 PointF(cx + (btnW[(size_t)i] - lb.Width) / 2, byB + (btnH - lb.Height) / 2), &fmt, &lbr);
             RECT rc = { (LONG)cx, (LONG)byB, (LONG)(cx + btnW[(size_t)i]), (LONG)(byB + btnH) };
@@ -2423,6 +3258,7 @@ void RenderTip(HWND hwnd)
     g_todoHitRects.clear();
     g_rowHitRects.clear();
     g_pillHitRects.clear();
+    g_groupHitRects.clear();
     std::unordered_map<std::wstring, float> rowY;
     double settleT = g_settling ? EaseOutCubic(duration<double>(nowSteady - g_settleStart).count() / SETTLE_ANIM_SEC) : 1.0;
     double animP = g_completeAnim.active ? Clamp01(duration<double>(nowSteady - g_completeAnim.start).count() / COMPLETE_ANIM_SEC) : 0.0;
@@ -2430,156 +3266,180 @@ void RenderTip(HWND hwnd)
     for (auto& r : rows) {
         if (r.type == RT_SPACER) continue;
         float ry = M + r.y;
-        if (r.type == RT_HEADING) { drawText(r.text, fHead, bx, ry, ink); continue; }
-        if (r.type == RT_META) { drawText(r.text, fMeta, bx, ry, meta); continue; }
+        double fd = r.fade;
+        if (r.type == RT_HEADING) { drawText(r.text, fHead, bx, ry, Faded(ink, fd)); continue; }
+        if (r.type == RT_META) { drawText(r.text, fMeta, bx + r.depth * indentStep, ry, Faded(meta, fd)); continue; }
 
-        // 已完成项沉底时，从旧位置平滑滑到新位置
-        if (g_settling) {
+        // 行位置变化（完成沉底 / 折叠展开 / 隐藏）时，从旧位置平滑滑到新位置
+        if (g_settling && !r.key.empty()) {
             auto it = g_settleFrom.find(r.key);
             if (it != g_settleFrom.end()) ry = (float)(M + it->second + (r.y - it->second) * settleT);
         }
-        if (!rowY.count(r.key)) rowY[r.key] = ry - M;
+        if (!r.key.empty() && !rowY.count(r.key)) rowY[r.key] = ry - M;
 
         float rh = (r.h > checkD ? r.h : (float)checkD);
         float cy = ry + rh / 2.0f - checkD / 2.0f;
-        float stroke = base * 0.06f; if (stroke < 1.25f) stroke = 1.25f;
-        float textX = bx + checkD + checkGap;
-        float rowL = bx - base * 0.35f, rowR = rightX + base * 0.35f;
+        float ix = bx + r.depth * indentStep;   // 本行左缘（按嵌套深度缩进）
+        float textX = ix + checkD + checkGap;
+        float rowL = ix - base * 0.35f, rowR = rightX + base * 0.35f;
         float rowT = ry - base * 0.22f, rowHt = rh + base * 0.44f;
-        bool animating = g_completeAnim.active && !r.completed && r.key == g_completeAnim.key;
+        float ccx = ix + checkD / 2.0f, ccy = cy + checkD / 2.0f;
+
+        // ---- 分组标题：细线箭头 + 名称；折叠时右侧显示数量与最近的截止时间 ----
+        if (r.type == RT_GROUP) {
+            float cs = checkD * 0.30f;
+            Pen chev(Faded(groupInk, fd), (std::max)(1.2f, stroke * 0.95f));
+            chev.SetStartCap(LineCapRound);
+            chev.SetEndCap(LineCapRound);
+            chev.SetLineJoin(LineJoinRound);
+            float gcy = ry + r.h / 2.0f;
+            if (r.folded) {
+                PointF pts[3] = { PointF(ccx - cs * 0.45f, gcy - cs), PointF(ccx + cs * 0.55f, gcy), PointF(ccx - cs * 0.45f, gcy + cs) };
+                g.DrawLines(&chev, pts, 3);
+            } else {
+                PointF pts[3] = { PointF(ccx - cs, gcy - cs * 0.45f), PointF(ccx, gcy + cs * 0.55f), PointF(ccx + cs, gcy - cs * 0.45f) };
+                g.DrawLines(&chev, pts, 3);
+            }
+            drawText(r.text, fGroup, textX, ry, Faded(groupInk, fd));
+            if (!r.summary.empty()) {
+                RectF sb = measure(r.summary, fMeta);
+                Color sc = meta;
+                if (r.nearestDue > 0 && r.nearestDue <= nowE) sc = coral;
+                drawText(r.summary, fMeta, rightX - sb.Width, ry + (r.h - sb.Height) / 2.0f, Faded(sc, fd * 0.9));
+            }
+            RECT rc = { (LONG)rowL, (LONG)rowT, (LONG)rowR, (LONG)(rowT + rowHt) };
+            g_groupHitRects.push_back({ rc, r.sourceIndex, r.key, false });
+            g_rowHitRects.push_back({ rc, r.sourceIndex, r.key, false });
+            continue;
+        }
+
+        bool animating = r.type == RT_TODO && g_completeAnim.active && !r.completed && r.key == g_completeAnim.key;
         bool alerting = g_alertActive && !g_alertTaskKey.empty() && !r.completed && r.key == g_alertTaskKey;
 
         if (alerting || animating) {
             GraphicsPath hp;
             RoundRectPath(hp, rowL, rowT, rowR - rowL, rowHt, base * 0.35f);
-            SolidBrush hb(alerting ? WithAlpha(coral, 26.0 + 34.0 * pulse) : WithAlpha(accentDone, 34.0 * std::sin(ANIM_PI * animP)));
+            SolidBrush hb(alerting ? WithAlpha(coral, 22.0 + 30.0 * pulse) : WithAlpha(accentDone, 30.0 * std::sin(ANIM_PI * animP)));
             g.FillPath(&hb, &hp);
         }
 
-        if (animating) {
-            // 完成动画：涟漪 + 光点 + 复选框弹出填充 + 对勾描绘 + 删除线划过
+        if (r.type == RT_COUNTDOWN) {
+            // 独立倒计时：细线小钟代替复选框
+            Color ic = Faded(r.completed ? doneCheck : toneColor(r.pillTone), fd);
+            Pen ip(ic, stroke);
+            ip.SetStartCap(LineCapRound);
+            ip.SetEndCap(LineCapRound);
+            float cr = checkD / 2.0f - stroke / 2.0f;
+            g.DrawEllipse(&ip, ccx - cr, ccy - cr, cr * 2, cr * 2);
+            g.DrawLine(&ip, ccx, ccy, ccx, ccy - cr * 0.55f);
+            g.DrawLine(&ip, ccx, ccy, ccx + cr * 0.42f, ccy + cr * 0.20f);
+            drawText(r.text, fText, textX, ry, Faded(r.completed ? doneInk : ink, fd));
+        } else if (animating) {
+            // 完成动画：涟漪 + 光点 + 圆形复选框弹出填充 + 对勾描绘 + 删除线划过
             double pf = EaseOutBack(animP / 0.32);
             double pt = Clamp01((animP - 0.16) / 0.30);
             double pr = Clamp01(animP / 0.80);
             double ps = EaseInOutCubic((animP - 0.28) / 0.55);
-            float ccx = bx + checkD / 2.0f, ccy = cy + checkD / 2.0f;
             {
-                float rr = checkD * (0.55f + 1.30f * (float)EaseOutCubic(pr));
-                Pen rp(WithAlpha(accentDone, 170.0 * (1.0 - pr)), (std::max)(1.0f, stroke * (float)(1.5 - pr)));
+                float rr = checkD * (0.55f + 1.25f * (float)EaseOutCubic(pr));
+                Pen rp(WithAlpha(accentDone, 160.0 * (1.0 - pr)), (std::max)(1.0f, stroke * (float)(1.5 - pr)));
                 g.DrawEllipse(&rp, ccx - rr, ccy - rr, rr * 2, rr * 2);
             }
             for (int k = 0; k < 8; ++k) {
                 double ang = k * ANIM_PI / 4.0 + 0.39;
                 double dist = checkD * (0.6 + 1.5 * EaseOutCubic(pr));
-                float ds = (float)(checkD * 0.13 * (1.0 - pr));
+                float ds = (float)(checkD * 0.11 * (1.0 - pr));
                 if (ds < 0.3f) continue;
-                SolidBrush sb(WithAlpha(k % 2 == 0 ? accentDone : accentGold, 235.0 * (1.0 - pr)));
+                SolidBrush sb(WithAlpha(k % 2 == 0 ? accentDone : accentGold, 225.0 * (1.0 - pr)));
                 float sx = ccx + (float)(std::cos(ang) * dist), sy = ccy + (float)(std::sin(ang) * dist);
                 g.FillEllipse(&sb, sx - ds, sy - ds, ds * 2, ds * 2);
             }
             Pen boxPen(LerpColor(checkc, accentDone, animP / 0.2), stroke);
-            g.DrawRectangle(&boxPen, bx, cy, (REAL)checkD, (REAL)checkD);
+            float cr = checkD / 2.0f - stroke / 2.0f;
+            g.DrawEllipse(&boxPen, ccx - cr, ccy - cr, cr * 2, cr * 2);
             float fs = (float)(checkD * pf);
             if (fs > 0.5f) {
                 SolidBrush fb(accentDone);
-                g.FillRectangle(&fb, ccx - fs / 2, ccy - fs / 2, fs, fs);
+                g.FillEllipse(&fb, ccx - fs / 2, ccy - fs / 2, fs, fs);
             }
-            DrawTick(g, bx, cy, (float)checkD, pt, Color(255, 255, 255, 255), stroke + 0.35f);
+            DrawTick(g, ix, cy, (float)checkD, pt, Color(255, 255, 255, 255), stroke + 0.3f);
             Color tc = LerpColor(ink, doneInk, ps);
             drawText(r.text, fText, textX, ry, tc);
             if (ps > 0.0) {
-                Pen sp(tc, (std::max)(1.2f, base * 0.06f));
+                Pen sp(tc, (std::max)(1.2f, base * 0.055f));
                 float sy = ry + r.h * 0.54f;
                 g.DrawLine(&sp, textX, sy, textX + r.tw * (float)ps, sy);
             }
         } else {
-            Color boxColor = r.completed ? doneCheck : checkc;
+            float cr = checkD / 2.0f - stroke / 2.0f;
             if (r.completed) {
-                SolidBrush fill(doneFill);
-                g.FillRectangle(&fill, bx, cy, (REAL)checkD, (REAL)checkD);
+                SolidBrush fill(Faded(doneFill, fd));
+                g.FillEllipse(&fill, ccx - checkD / 2.0f, ccy - checkD / 2.0f, (REAL)checkD, (REAL)checkD);
             }
-            Pen boxPen(boxColor, stroke);
-            g.DrawRectangle(&boxPen, bx, cy, (REAL)checkD, (REAL)checkD);
-            if (r.completed) DrawTick(g, bx, cy, (float)checkD, 1.0, doneCheck, stroke + 0.35f);
+            Pen boxPen(Faded(r.completed ? doneCheck : checkc, fd), stroke);
+            g.DrawEllipse(&boxPen, ccx - cr, ccy - cr, cr * 2, cr * 2);
+            if (r.completed) DrawTick(g, ix, cy, (float)checkD, 1.0, Faded(doneCheck, fd), stroke + 0.3f);
             // 刚完成的一项：滑动期间强调色逐渐褪为已完成样式
             if (r.completed && g_settling && r.key == g_justCompletedKey) {
                 double a = 1.0 - settleT;
                 SolidBrush fb(WithAlpha(accentDone, 255.0 * a));
-                g.FillRectangle(&fb, bx, cy, (REAL)checkD, (REAL)checkD);
-                DrawTick(g, bx, cy, (float)checkD, 1.0, Color((BYTE)ClampByte(255.0 * a), 255, 255, 255), stroke + 0.35f);
+                g.FillEllipse(&fb, ccx - checkD / 2.0f, ccy - checkD / 2.0f, (REAL)checkD, (REAL)checkD);
+                DrawTick(g, ix, cy, (float)checkD, 1.0, Color((BYTE)ClampByte(255.0 * a), 255, 255, 255), stroke + 0.3f);
             }
             Font& todoFont = r.completed ? fTextDone : fText;
-            drawText(r.text, todoFont, textX, ry, r.completed ? doneInk : ink);
+            drawText(r.text, todoFont, textX, ry, Faded(r.completed ? doneInk : ink, fd));
         }
 
         if (r.sourceIndex >= 0) {
-            int inflate = (int)(base * 0.20f); if (inflate < 4) inflate = 4;
-            RECT hit = { (LONG)(bx - inflate), (LONG)(cy - inflate), (LONG)(bx + checkD + inflate), (LONG)(cy + checkD + inflate) };
-            g_todoHitRects.push_back({ hit, r.sourceIndex, r.key, r.completed });
             RECT rowRc = { (LONG)rowL, (LONG)rowT, (LONG)rowR, (LONG)(rowT + rowHt) };
             g_rowHitRects.push_back({ rowRc, r.sourceIndex, r.key, r.completed });
+            if (r.type == RT_TODO) {
+                int inflate = (int)(base * 0.20f); if (inflate < 4) inflate = 4;
+                RECT hit = { (LONG)(ix - inflate), (LONG)(cy - inflate), (LONG)(ix + checkD + inflate), (LONG)(cy + checkD + inflate) };
+                g_todoHitRects.push_back({ hit, r.sourceIndex, r.key, r.completed });
+            }
         }
 
-        // ---- 计时胶囊 ----
-        TaskTimer* tm = (pillColW > 0) ? FindTaskTimer(r.key) : nullptr;
-        if (tm) {
+        // ---- 计时胶囊：细进度环 + 数字；只有到点 / 提醒时才有底色 ----
+        if (r.pill && pillColW > 0) {
             float px = rightX - pillColW;
             float py = ry + rh / 2.0f - pillH / 2.0f;
-            long long el = TimerElapsed(*tm);
-            bool running = tm->start > 0;
-            bool expired = tm->countdown && el >= tm->duration;
-            std::wstring label;
-            double frac = 0.0;
-            Color ringC = sky;
-            if (tm->countdown) {
-                long long rem = tm->duration - el;
-                if (rem > 0) {
-                    label = FormatClock(rem);
-                    frac = tm->duration > 0 ? (double)rem / (double)tm->duration : 0.0;
-                    ringC = (rem <= 60 || rem * 5 <= tm->duration) ? amber : sky;
-                } else {
-                    label = L"+" + FormatClock(-rem);   // 超时多久
-                    frac = 1.0;
-                    ringC = coral;
-                }
-            } else {
-                label = FormatClock(el);
-                frac = (double)(el % 60) / 60.0;
-                ringC = violet;
-            }
-            double fade = r.completed ? 120.0 : (running ? 255.0 : 175.0);
+            Color ringC = toneColor(r.pillTone);
+            double fade = (r.completed ? 0.45 : (r.pillRunning ? 1.0 : 0.65)) * fd;
 
-            GraphicsPath pp;
-            RoundRectPath(pp, px, py, pillColW, pillH, pillH / 2);
-            Color pbg = (expired && !r.completed)
-                ? WithAlpha(coral, alerting ? 60.0 + 50.0 * pulse : 52.0)
-                : Color((BYTE)(r.completed ? 14 : 26), TR, TG, TB);
-            SolidBrush pbr(pbg);
-            g.FillPath(&pbr, &pp);
+            if (r.pillExpired && !r.completed) {
+                GraphicsPath pp;
+                RoundRectPath(pp, px, py, pillColW, pillH, pillH / 2);
+                SolidBrush pbr(WithAlpha(coral, (alerting ? 46.0 + 40.0 * pulse : 36.0) * fd));
+                g.FillPath(&pbr, &pp);
+            }
 
             float rcx = px + pillPadX + ringD / 2.0f, rcy = py + pillH / 2.0f;
-            float rw = (std::max)(1.5f, ringD * 0.16f);
+            float rw = (std::max)(1.3f, ringD * 0.13f);
             float rd = ringD - rw;
-            Pen track(Color((BYTE)ClampByte(fade * 0.28), TR, TG, TB), rw);
+            Pen track(Color((BYTE)ClampByte(255.0 * fade * 0.20), TR, TG, TB), rw);
             g.DrawEllipse(&track, rcx - rd / 2, rcy - rd / 2, rd, rd);
-            Pen arc(WithAlpha(ringC, fade), rw);
+            Pen arc(WithAlpha(ringC, 255.0 * fade), rw);
             arc.SetStartCap(LineCapRound);
             arc.SetEndCap(LineCapRound);
-            if (frac >= 0.999) g.DrawEllipse(&arc, rcx - rd / 2, rcy - rd / 2, rd, rd);
-            else if (frac > 0.001) g.DrawArc(&arc, rcx - rd / 2, rcy - rd / 2, rd, rd, -90.0f, (REAL)(360.0 * frac));
-            if (!running) {   // 暂停：中间两道竖线
-                SolidBrush pb(WithAlpha(ringC, fade));
+            if (r.pillFrac >= 0.999) g.DrawEllipse(&arc, rcx - rd / 2, rcy - rd / 2, rd, rd);
+            else if (r.pillFrac > 0.001) g.DrawArc(&arc, rcx - rd / 2, rcy - rd / 2, rd, rd, -90.0f, (REAL)(360.0 * r.pillFrac));
+            if (!r.pillRunning) {   // 暂停：中间两道竖线
+                SolidBrush pb(WithAlpha(ringC, 255.0 * fade));
                 float bw2 = (std::max)(1.2f, rw * 0.75f), bh2 = ringD * 0.34f;
                 g.FillRectangle(&pb, rcx - bw2 * 1.6f, rcy - bh2 / 2, bw2, bh2);
                 g.FillRectangle(&pb, rcx + bw2 * 0.6f, rcy - bh2 / 2, bw2, bh2);
             }
-            RectF lb = measure(label, fTimer);
-            SolidBrush lbr(expired && !r.completed ? WithAlpha(Color(255, 255, 150, 140), fade) : Color((BYTE)ClampByte(fade), TR, TG, TB));
-            g.DrawString(label.c_str(), (INT)label.size(), &fTimer,
+            RectF lb = measure(r.pillLabel, fTimer);
+            Color lc = (r.pillExpired && !r.completed) ? Color(255, 255, 160, 150) : Color(225, TR, TG, TB);
+            SolidBrush lbr(Faded(lc, fade));
+            g.DrawString(r.pillLabel.c_str(), (INT)r.pillLabel.size(), &fTimer,
                 PointF(rcx + ringD / 2.0f + pillInnerGap, py + (pillH - lb.Height) / 2.0f), &fmt, &lbr);
 
             RECT prc = { (LONG)px, (LONG)py, (LONG)(px + pillColW), (LONG)(py + pillH) };
-            g_pillHitRects.push_back({ prc, r.sourceIndex, r.key, r.completed });
+            TodoHitRect ph = { prc, r.sourceIndex, r.key, r.completed };
+            ph.kind = r.pillDue ? 1 : 0;
+            g_pillHitRects.push_back(ph);
         }
     }
     g_lastRowY.swap(rowY);
@@ -2686,11 +3546,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             for (const auto& b : g_bannerButtons) {                 // 提醒横幅按钮
                 if (PtInRect(&b.rc, p)) { HandleBannerAction(hWnd, b.action); return 0; }
             }
-            for (const auto& h : g_pillHitRects) {                  // 计时胶囊：暂停 / 继续
-                if (PtInRect(&h.rc, p)) { ToggleTaskTimerPause(h.key); RenderTip(hWnd); return 0; }
+            for (const auto& h : g_pillHitRects) {                  // 计时胶囊
+                if (!PtInRect(&h.rc, p)) continue;
+                if (h.kind == 1) {                                   // 截止时间：在「剩余时长 / 截止时刻」之间切换
+                    g_dueShowAbsolute = !g_dueShowAbsolute;
+                    confWrite();
+                } else {                                             // 正计时：暂停 / 继续
+                    ToggleTaskTimerPause(h.key);
+                }
+                RenderTip(hWnd);
+                return 0;
             }
             for (const auto& h : g_todoHitRects) {                  // 复选框：完成动画
                 if (PtInRect(&h.rc, p)) { TodoHitRect copy = h; BeginToggle(hWnd, copy); return 0; }
+            }
+            for (const auto& h : g_groupHitRects) {                 // 分组标题：折叠 / 展开
+                if (PtInRect(&h.rc, p)) {
+                    SnapshotRowsForSettle();
+                    ToggleGroupFold(h.sourceIndex, h.key);
+                    SetAnimTimer(hWnd);
+                    RenderTip(hWnd);
+                    return 0;
+                }
             }
         }
 
@@ -2775,12 +3652,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ChooseFontFamily(hWnd);
         }
         if (LOWORD(wParam) == ID_MODE_DESKTOP) {
-            g_displayMode = 0;          // 附着桌面（默认）
+            g_displayMode = 0;          // 附着桌面
+            g_peekActive = false;
             confWrite();
             ApplyDisplayMode(hWnd, 0);
         }
+        if (LOWORD(wParam) == ID_MODE_SMART) {
+            g_displayMode = 2;          // 智能浮现
+            g_peekActive = false;
+            g_lastGlance = NowEpoch();
+            confWrite();
+            ApplyDisplayMode(hWnd, 2);
+            UpdatePeek(hWnd);
+        }
+        if (LOWORD(wParam) >= ID_SURFACE_LEAD_FIRST && LOWORD(wParam) < ID_SURFACE_LEAD_FIRST + 4) {
+            g_surfaceLeadMin = kSurfaceLeadOpts[LOWORD(wParam) - ID_SURFACE_LEAD_FIRST];
+            confWrite();
+            UpdatePeek(hWnd);
+            RenderTip(hWnd);
+        }
+        if (LOWORD(wParam) >= ID_SURFACE_EVERY_FIRST && LOWORD(wParam) < ID_SURFACE_EVERY_FIRST + 4) {
+            g_surfaceEveryMin = kSurfaceEveryOpts[LOWORD(wParam) - ID_SURFACE_EVERY_FIRST];
+            g_lastGlance = NowEpoch();
+            confWrite();
+        }
         if (LOWORD(wParam) == ID_MODE_TOPMOST) {
             g_displayMode = 1;          // 始终置顶
+            g_peekActive = false;
             confWrite();
             ApplyDisplayMode(hWnd, 1);
         }
@@ -2789,39 +3687,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             confWrite();
             UpdateHoverHideTimer(hWnd);
         }
-        if (LOWORD(wParam) == ID_COUNTDOWN_1MIN) {
-            ArmCountdown(hWnd, 60);
-        }
-        if (LOWORD(wParam) == ID_COUNTDOWN_5MIN) {
-            ArmCountdown(hWnd, 5 * 60);
-        }
-        if (LOWORD(wParam) == ID_COUNTDOWN_10MIN) {
-            ArmCountdown(hWnd, 10 * 60);
-        }
-        if (LOWORD(wParam) == ID_COUNTDOWN_1HOUR) {
-            ArmCountdown(hWnd, 60 * 60);
-        }
-        if (LOWORD(wParam) == ID_COUNTDOWN_REPEAT) {
-            g_countdownRepeatEnabled = !g_countdownRepeatEnabled;
+        if (LOWORD(wParam) >= ID_HOVER_DELAY_FIRST &&
+            LOWORD(wParam) < ID_HOVER_DELAY_FIRST + (int)(sizeof(kHoverDelayPresetsMs) / sizeof(kHoverDelayPresetsMs[0]))) {
+            g_hoverHideDelayMs = kHoverDelayPresetsMs[LOWORD(wParam) - ID_HOVER_DELAY_FIRST];
+            g_hoverStartTick = 0;
             confWrite();
         }
-        if (LOWORD(wParam) == ID_COUNTDOWN_CUSTOM) {
-            ShowCountdownPrompt(hWnd);
+        if (LOWORD(wParam) == ID_NEW_COUNTDOWN) {
+            PromptNewCountdown(hWnd);
+            RenderTip(hWnd);
         }
-        if (LOWORD(wParam) == ID_ALARM_CUSTOM) {
-            ShowAlarmPrompt(hWnd);
+        if (LOWORD(wParam) == ID_SHOW_HIDDEN) {
+            SnapshotRowsForSettle();
+            g_showHidden = !g_showHidden;
+            confWrite();
+            SetAnimTimer(hWnd);
+            RenderTip(hWnd);
+        }
+        if (LOWORD(wParam) == ID_SINK_DONE) {
+            g_sinkCompleted = !g_sinkCompleted;
+            confWrite();
+            RenderTip(hWnd);
         }
         if (LOWORD(wParam) == ID_REMINDER_CANCEL) {
             if (g_alertActive) {
+                DismissDueItem(g_alertTaskKey);
                 StopCardAlert(hWnd);
-            } else {
-                g_reminderArmed = false;
-                g_reminderIsCountdown = false;
-                g_reminderIntervalSeconds = 0;
             }
         }
-        if (LOWORD(wParam) >= ID_TASK_CD_FIRST && LOWORD(wParam) <= ID_TASK_REMOVE) {
-            HandleTaskTimerCommand(hWnd, LOWORD(wParam));
+        if (LOWORD(wParam) >= ID_TASK_CD_FIRST && LOWORD(wParam) <= ID_ITEM_LAST) {
+            HandleItemCommand(hWnd, LOWORD(wParam));
         }
         if (LOWORD(wParam) == ID_FONTSIZE_INCREASE) {
             fontHeight+=5;
@@ -2905,6 +3800,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             POINT p = { mx, my };
             for (const auto& h : g_pillHitRects) if (PtInRect(&h.rc, p)) return 0;
+            for (const auto& h : g_groupHitRects) if (PtInRect(&h.rc, p)) return 0;
             for (const auto& b : g_bannerButtons) if (PtInRect(&b.rc, p)) return 0;
         }
 
@@ -2957,7 +3853,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     case WM_TIMER:
         if (wParam == TIMER_REFRESH) {
-            if (g_displayMode == 1) {
+            if (g_displayMode == 1 || g_peekActive) {
                 // 周期性重新置顶：防止个别全屏/置顶程序抢走最上层
                 SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -2965,9 +3861,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             RenderTip(hWnd);
         }
         if (wParam == TIMER_REMINDER_CHECK) {
-            CheckReminder(hWnd);
-            CheckTaskTimers(hWnd);
-            if (!g_animTimerOn && AnyTaskTimerRunning()) RenderTip(hWnd);   // 每秒刷新计时显示
+            CheckDeadlines(hWnd);
+            if (!g_animTimerOn && (AnyTaskTimerRunning() || g_hasDuePill)) RenderTip(hWnd);   // 每秒刷新计时显示
         }
         if (wParam == TIMER_ANIM) {
             TickAnimations(hWnd);
@@ -3041,7 +3936,10 @@ void ApplyDisplayMode(HWND hwnd, int mode) {
     }
     SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);
 
-    if (mode == 1) {
+    if (mode == 2 && g_peekActive) {
+        // —— 智能浮现：正处于轻浮层 ——
+        RaiseForAlert(hwnd);
+    } else if (mode == 1) {
         // —— 始终置顶 ——
         ex |= WS_EX_TOPMOST;
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
@@ -3065,7 +3963,7 @@ void ApplyDisplayMode(HWND hwnd, int mode) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
     RenderTip(hwnd);   // 绑定/层级变化后重绘（UpdateLayeredWindow 会按屏幕坐标重新定位）
-    UpdateHoverHideTimer(hwnd);   // 仅「始终置顶」且开启设置时启用悬停隐藏
+    UpdateHoverHideTimer(hwnd);   // 「始终置顶」+ 设置开启，或智能浮现的轻浮层时启用
 }
 
 // 探测“现代独立壁纸层 WorkerW”：即 0x052C 之后由 Explorer 创建、与承载 SHELLDLL_DefView 的
@@ -3186,6 +4084,13 @@ void confCreate() {
         ofs << "DisplayMode: " << g_displayMode << std::endl;
         ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
         ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+        ofs << "HoverHideDelay: " << g_hoverHideDelayMs << std::endl;
+        ofs << "SurfaceLead: " << g_surfaceLeadMin << std::endl;
+        ofs << "SurfaceEvery: " << g_surfaceEveryMin << std::endl;
+    ofs << "ShowHidden: " << (g_showHidden ? 1 : 0) << std::endl;
+    ofs << "SinkCompleted: " << (g_sinkCompleted ? 1 : 0) << std::endl;
+    ofs << "DueDisplay: " << (g_dueShowAbsolute ? 1 : 0) << std::endl;
+    ofs << "DueInputMode: " << g_dueInputMode << std::endl;
     }
 }
 
@@ -3249,8 +4154,29 @@ void readFromFile(int& x, int& y) {
         else if (line.find("CountdownRepeat:") == 0) {
             g_countdownRepeatEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
         }
+        else if (line.find("SurfaceLead:") == 0) {
+            try { g_surfaceLeadMin = (std::max)(1, std::stoi(line.substr(line.find(":") + 1))); } catch (...) {}
+        }
+        else if (line.find("SurfaceEvery:") == 0) {
+            try { g_surfaceEveryMin = (std::max)(0, std::stoi(line.substr(line.find(":") + 1))); } catch (...) {}
+        }
+        else if (line.find("HoverHideDelay:") == 0) {
+            try { g_hoverHideDelayMs = (std::max)(0, (std::min)(60000, std::stoi(line.substr(line.find(":") + 1)))); } catch (...) {}
+        }
         else if (line.find("HoverHide:") == 0) {
             g_hoverHideEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
+        }
+        else if (line.find("ShowHidden:") == 0) {
+            g_showHidden = (std::atoi(line.substr(line.find(":") + 1).c_str()) != 0);
+        }
+        else if (line.find("SinkCompleted:") == 0) {
+            g_sinkCompleted = (std::atoi(line.substr(line.find(":") + 1).c_str()) != 0);
+        }
+        else if (line.find("DueDisplay:") == 0) {
+            g_dueShowAbsolute = (std::atoi(line.substr(line.find(":") + 1).c_str()) != 0);
+        }
+        else if (line.find("DueInputMode:") == 0) {
+            g_dueInputMode = (std::atoi(line.substr(line.find(":") + 1).c_str()) == 0) ? 0 : 1;
         }
     }
 
@@ -3270,10 +4196,15 @@ void readFromFile(int& x, int& y) {
             std::ofstream todoFile(localTodo);
             if (todoFile.is_open()) {
                 // 行角色：# 大字标题(时钟)  > 灰字次要(日期/页脚)  - 圆点待办  空行=间隔
+                // 行角色：# 大字标题(时钟)  > 灰字次要(日期/页脚)  ## 分组  - 待办  ! 独立倒计时  空行=间隔
                 todoFile << "# {{TIME}}\n";
                 todoFile << "> {{DATE}}  {{WEEK}}\n";
+                todoFile << "## 工作\n";
                 todoFile << "- 项目：撰写结题报告\n";
                 todoFile << "- 论文：提升论文质量\n";
+                todoFile << "## 生活 _FOLD\n";
+                todoFile << "- 买菜\n";
+                todoFile << "##\n";
                 todoFile << "> 本周剩 {{DAYS_LEFT_WEEK}} · 本月剩 {{DAYS_LEFT_MONTH}} · 本年剩 {{DAYS_LEFT_YEAR}} 天\n";
                 todoFile.close();
             }
@@ -3312,7 +4243,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
         }
     }
     hInst = hInstance;
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_DATE_CLASSES | ICC_UPDOWN_CLASS };
     InitCommonControlsEx(&icc); // 启用滑动条等通用控件
     Gdiplus::GdiplusStartupInput gdiInput;
     ULONG_PTR gdiToken = 0;
