@@ -71,7 +71,7 @@ The macOS build is ad-hoc signed. If macOS blocks the first launch, **right-clic
 ## Quick start
 
 1. Launch DesktopTip. On first run it creates a sample `TODO.txt`.
-2. **Double-click the card** (or menu "编辑 TODO") to open the file, edit it using the [syntax below](#todotxt-syntax), and save.
+2. **Double-click the card** (or menu "编辑 TODO") to open the editor (built-in window on macOS, ⌘S to save; default editor on Windows), edit it using the [syntax below](#todotxt-syntax), and save.
 3. Click the circle before a task to complete it; click a group header to fold/unfold it.
 4. Right-click a task to set a deadline; right-click empty space for a new countdown.
 5. Drag the card into place; right-click → "外观设置…" for size, spacing, opacity, colours and font.
@@ -165,7 +165,7 @@ Lead time (5 / 10 / 15 / 30 min) and periodic glance (30 / 45 / 60 min / off) ar
 | Click a group header | Fold / unfold |
 | Click a timer pill | Deadline: toggle remaining/deadline; stopwatch: pause/resume |
 | Drag the card | Move it; position is saved |
-| Double-click the card | Open the TODO file in the default editor |
+| Double-click the card | Edit the TODO file (macOS: built-in editor window, ⌘S to save; "用默认应用打开" still opens it in another app) |
 | Right-click | Menu; on a row, row-specific actions appear first |
 
 ## Configuration
