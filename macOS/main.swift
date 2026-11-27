@@ -1,6 +1,10 @@
 // DesktopTip for macOS — native AppKit port of the Win32 version.
-// Same TODO.txt format ("# 标题", "> 次要", "- 待办", "_OK" 完成标记, {{DATE}} 等占位符)
-// and the same config keys, stored in ~/Library/Application Support/DesktopTip/config.
+// Same TODO.txt format as Windows and the same config keys, stored in ~/Library/Application Support/DesktopTip/config.
+//
+// TODO.txt 行首：# 大标题 / > 次要说明 / ## 分组（### 子分组 …）/ ! 独立倒计时 / - 或 * 或直接文字 = 待办；
+//   单独一行 ## 结束所有分组，单独一行 ### 结束二级及更深的分组。
+// 行尾标记（顺序任意）：_OK 已完成、_HIDE 隐藏、_FOLD 折叠分组、_SHOW 分组折叠/隐藏时仍显示、
+//   @YYYY-MM-DD HH:MM:SS 截止时间、/30m 到点后按间隔重复（s/m/h/d）。
 import Cocoa
 
 // MARK: - Paths & config
@@ -20,8 +24,12 @@ struct Config {
     var bgAlpha = 128
     var fontFamily = "PingFang SC"
     var displayMode = 0          // 0 = 附着桌面, 1 = 始终置顶
-    var countdownRepeat = false
+    var countdownRepeat = false  // 新建独立倒计时时「重复」的默认值
     var hoverHide = true         // 始终置顶时鼠标悬停隐藏（按住 ⌘ 可操作）
+    var showHidden = false       // 临时显示带 _HIDE 的条目（淡显）
+    var dueShowAbsolute = false  // 截止时间胶囊显示截止时刻（true）还是剩余时长（false）
+    var dueInputMode = 1         // 倒计时对话框默认页：0 = 截止时间，1 = 剩余时长
+    var sinkCompleted = false    // 勾选完成后是否把已完成项沉到段末（默认原位不动）
 
     var textColor: NSColor { NSColor(srgbRed: CGFloat(text.r) / 255, green: CGFloat(text.g) / 255, blue: CGFloat(text.b) / 255, alpha: 1) }
     var bgColor: NSColor { NSColor(srgbRed: CGFloat(bg.r) / 255, green: CGFloat(bg.g) / 255, blue: CGFloat(bg.b) / 255, alpha: 1) }
@@ -52,6 +60,10 @@ struct Config {
             case "DisplayMode": c.displayMode = n
             case "CountdownRepeat": c.countdownRepeat = n != 0
             case "HoverHide": c.hoverHide = n != 0
+            case "ShowHidden": c.showHidden = n != 0
+            case "DueDisplay": c.dueShowAbsolute = n != 0
+            case "DueInputMode": c.dueInputMode = n == 0 ? 0 : 1
+            case "SinkCompleted": c.sinkCompleted = n != 0
             default: break
             }
         }
@@ -67,7 +79,8 @@ struct Config {
         out += "TextColor_R: \(text.r)\nTextColor_G: \(text.g)\nTextColor_B: \(text.b)\n"
         out += "BgAlpha: \(bgAlpha)\nBgColor_R: \(bg.r)\nBgColor_G: \(bg.g)\nBgColor_B: \(bg.b)\n"
         out += "FontFamily: \(fontFamily)\nDisplayMode: \(displayMode)\nCountdownRepeat: \(countdownRepeat ? 1 : 0)\n"
-        out += "HoverHide: \(hoverHide ? 1 : 0)\n"
+        out += "HoverHide: \(hoverHide ? 1 : 0)\nShowHidden: \(showHidden ? 1 : 0)\nSinkCompleted: \(sinkCompleted ? 1 : 0)\n"
+        out += "DueDisplay: \(dueShowAbsolute ? 1 : 0)\nDueInputMode: \(dueInputMode)\n"
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
@@ -108,37 +121,265 @@ func trimRight(_ s: String) -> String {
     return s
 }
 
-/// Returns (text, completed) for a todo line, nil for heading/meta/blank lines.
-func parseTodo(_ line: String) -> (text: String, done: Bool)? {
-    let t = String(trimRight(line).drop(while: { $0 == " " || $0 == "\t" }))
-    if t.isEmpty || t.first == "#" || t.first == ">" { return nil }
-    var text = t
-    if (t.first == "-" || t.first == "*"), t.count > 1, t[t.index(after: t.startIndex)] == " " { text = String(t.dropFirst(2)) }
-    var done = false
-    let r = trimRight(text)
-    if r.hasSuffix("_OK") {
-        done = true
-        text = trimRight(String(r.dropLast(3)))
-    }
-    return (text, done)
+func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespaces) }
+
+func nowEpoch() -> Int { Int(Date().timeIntervalSince1970) }
+
+// MARK: - Line model（与 Windows 版一致）
+
+enum LineKind { case blank, heading, meta, group, groupEnd, todo, countdown }
+
+struct LineInfo {
+    var kind: LineKind = .blank
+    var lead = ""          // 缩进 + 行首符号
+    var text = ""          // 正文（去掉行首符号与行尾标记）
+    var ok = false, hide = false, fold = false, show = false
+    var level = 0          // 分组层级：## = 1，### = 2 …
+    var hasDue = false
+    var due = 0            // 截止时间（Unix 秒）
+    var repeatSec = 0      // 重复间隔（秒）
 }
 
-func stripOK(_ line: String) -> String {
-    let r = trimRight(line)
-    return r.hasSuffix("_OK") ? trimRight(String(r.dropLast(3))) : r
+let keyCDPrefix = "\u{1}C"      // 独立倒计时的键前缀
+let keyGroupPrefix = "\u{1}G"   // 分组的键前缀
+func isCountdownKey(_ k: String) -> Bool { k.hasPrefix(keyCDPrefix) }
+func isGroupKey(_ k: String) -> Bool { k.hasPrefix(keyGroupPrefix) }
+func keyDisplayName(_ k: String) -> String { (isCountdownKey(k) || isGroupKey(k)) ? String(k.dropFirst(2)) : k }
+
+let dueRegex = try! NSRegularExpression(pattern: "^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})(?:[ T\\t]+(\\d{1,2})[:：](\\d{2})(?:[:：](\\d{2}))?)?$")
+
+/// 「YYYY-MM-DD」「YYYY-MM-DD HH:MM」「YYYY-MM-DD HH:MM:SS」；只写日期视为当天 23:59:59
+func parseDueText(_ s: String) -> Int? {
+    let s = trimmed(s)
+    guard let m = dueRegex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) else { return nil }
+    func g(_ i: Int) -> Int? {
+        let r = m.range(at: i)
+        guard r.location != NSNotFound, let rr = Range(r, in: s) else { return nil }
+        return Int(s[rr])
+    }
+    guard let y = g(1), let mo = g(2), let d = g(3) else { return nil }
+    var h = 23, mi = 59, sec = 59
+    if let hh = g(4), let mm = g(5) { h = hh; mi = mm; sec = g(6) ?? 0 }
+    guard (1971...2999).contains(y), (1...12).contains(mo), (1...31).contains(d), h < 24, mi < 60, sec < 60 else { return nil }
+    let comps = DateComponents(year: y, month: mo, day: d, hour: h, minute: mi, second: sec)
+    guard let date = Calendar.current.date(from: comps) else { return nil }
+    if Calendar.current.component(.day, from: date) != d { return nil }   // 2 月 30 日之类
+    return Int(date.timeIntervalSince1970)
+}
+
+func makeFormatter(_ f: String) -> DateFormatter {
+    let d = DateFormatter(); d.locale = Locale(identifier: "en_US_POSIX"); d.dateFormat = f; return d
+}
+let dueFormatter = makeFormatter("yyyy-MM-dd HH:mm:ss")
+func formatDueText(_ due: Int) -> String { dueFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(due))) }
+
+func formatRepeatText(_ r: Int) -> String {
+    if r % 86400 == 0 { return "\(r / 86400)d" }
+    if r % 3600 == 0 { return "\(r / 3600)h" }
+    if r % 60 == 0 { return "\(r / 60)m" }
+    return "\(r)s"
+}
+
+func stripSuffix(_ s: inout String, _ tok: String) -> Bool {
+    s = trimRight(s)
+    guard s.hasSuffix(tok) else { return false }
+    s = trimRight(String(s.dropLast(tok.count)))
+    return true
+}
+
+/// 行尾「@日期 [时间]」；@ 前须为空白或位于正文开头
+func stripDue(_ s: inout String) -> Int? {
+    s = trimRight(s)
+    guard let at = s.lastIndex(of: "@") else { return nil }
+    if at > s.startIndex {
+        let prev = s[s.index(before: at)]
+        if prev != " " && prev != "\t" { return nil }
+    }
+    guard let due = parseDueText(String(s[s.index(after: at)...])) else { return nil }
+    s = trimRight(String(s[..<at]))
+    return due
+}
+
+/// 行尾「/30m」之类的重复间隔
+func stripRepeat(_ s: inout String) -> Int? {
+    s = trimRight(s)
+    let sp = s.lastIndex(where: { $0 == " " || $0 == "\t" })
+    let tok = sp.map { String(s[s.index(after: $0)...]) } ?? s
+    guard tok.count >= 3, tok.first == "/", let u = tok.last else { return nil }
+    let mul = u == "s" ? 1 : u == "m" ? 60 : u == "h" ? 3600 : u == "d" ? 86400 : 0
+    guard mul > 0, let n = Int(tok.dropFirst().dropLast()), n > 0, n <= 1_000_000 else { return nil }
+    s = sp.map { trimRight(String(s[..<$0])) } ?? ""
+    return n * mul
+}
+
+func stripFlags(_ body: inout String, _ L: inout LineInfo, ok allowOk: Bool, due allowDue: Bool, fold allowFold: Bool) {
+    var changed = true
+    while changed {
+        changed = false
+        if allowOk, stripSuffix(&body, "_OK") { L.ok = true; changed = true; continue }
+        if stripSuffix(&body, "_HIDE") { L.hide = true; changed = true; continue }
+        if allowOk, stripSuffix(&body, "_SHOW") { L.show = true; changed = true; continue }
+        if allowFold, stripSuffix(&body, "_FOLD") { L.fold = true; changed = true; continue }
+        if allowDue, !L.hasDue {
+            var tmp = body
+            let rep = stripRepeat(&tmp)
+            if let d = stripDue(&tmp) {
+                L.hasDue = true; L.due = d; L.repeatSec = rep ?? 0
+                body = tmp; changed = true; continue
+            }
+        }
+    }
+}
+
+func parseLine(_ raw: String) -> LineInfo {
+    var L = LineInfo()
+    let s = trimRight(raw)
+    let indent = String(s.prefix(while: { $0 == " " || $0 == "\t" }))
+    let t = String(s.dropFirst(indent.count))
+    guard let first = t.first else { return L }
+
+    if t.hasPrefix("##") {
+        let hashes = t.prefix(while: { $0 == "#" }).count
+        var body = trimmed(String(t.dropFirst(hashes)))
+        L.level = hashes - 1
+        L.lead = indent + String(repeating: "#", count: hashes) + " "
+        if body.isEmpty { L.kind = .groupEnd; return L }
+        L.kind = .group
+        stripFlags(&body, &L, ok: false, due: false, fold: true)
+        L.text = trimmed(body)
+        return L
+    }
+    if first == "#" || first == ">" {
+        L.kind = first == "#" ? .heading : .meta
+        let n = (t.dropFirst().first == " ") ? 2 : 1
+        L.lead = indent + String(t.prefix(n))
+        var body = String(t.dropFirst(n))
+        stripFlags(&body, &L, ok: false, due: false, fold: false)
+        L.text = body
+        return L
+    }
+    if first == "!" {
+        var C = LineInfo()
+        var body = trimmed(String(t.dropFirst()))
+        stripFlags(&body, &C, ok: true, due: true, fold: false)
+        if C.hasDue {
+            C.kind = .countdown; C.lead = indent + "! "; C.text = trimmed(body)
+            return C
+        }
+        // 没有截止时间的 ! 行仍按普通待办处理（兼容旧文件）
+    }
+    L.kind = .todo
+    var body: String
+    if (first == "-" || first == "*"), t.count > 1, t[t.index(after: t.startIndex)] == " " {
+        L.lead = indent + String(t.prefix(2)); body = String(t.dropFirst(2))
+    } else {
+        L.lead = indent; body = t
+    }
+    stripFlags(&body, &L, ok: true, due: true, fold: false)
+    L.text = body
+    return L
+}
+
+func formatLine(_ L: LineInfo) -> String {
+    var s = L.lead + L.text
+    switch L.kind {
+    case .blank: return ""
+    case .groupEnd: return String(repeating: "#", count: max(2, L.level + 1))
+    case .heading, .meta:
+        if L.hide { s += " _HIDE" }
+        return s
+    case .group:
+        if L.hide { s += " _HIDE" }
+        if L.fold { s += " _FOLD" }
+        return s
+    default: break
+    }
+    var marker = false
+    if L.hasDue { s += " @" + formatDueText(L.due); marker = true }
+    if L.hasDue && L.repeatSec > 0 { s += " /" + formatRepeatText(L.repeatSec) }
+    if L.hide { s += " _HIDE"; marker = true }
+    if L.show { s += " _SHOW"; marker = true }
+    if L.ok { s += marker ? " _OK" : "_OK" }
+    return s
+}
+
+/// 条目键：任务 = 正文；独立倒计时 / 分组带内部前缀
+func itemKey(_ L: LineInfo) -> String {
+    switch L.kind {
+    case .todo: return trimmed(L.text)
+    case .countdown: return keyCDPrefix + trimmed(L.text)
+    case .group: return keyGroupPrefix + trimmed(L.text)
+    default: return ""
+    }
+}
+
+/// 只在同一段内（分组标题 / 分组结束 / # 大标题 都开启新段）把已完成的待办排到未完成之后
+func sortByCompletion(_ lines: inout [String]) {
+    var slots: [Int] = [], open: [String] = [], done: [String] = []
+    func flush() {
+        for (n, l) in (open + done).enumerated() { lines[slots[n]] = l }
+        slots = []; open = []; done = []
+    }
+    for i in lines.indices {
+        let L = parseLine(lines[i])
+        if L.kind == .group || L.kind == .groupEnd || L.kind == .heading { flush(); continue }
+        guard L.kind == .todo else { continue }
+        slots.append(i)
+        if L.ok { done.append(lines[i]) } else { open.append(lines[i]) }
+    }
+    flush()
+}
+
+/// 按键找到条目所在行；hint 为行号提示
+func findItemLine(_ lines: [String], _ hint: Int, _ key: String) -> Int? {
+    guard !key.isEmpty else { return nil }
+    if hint >= 0, hint < lines.count, itemKey(parseLine(lines[hint])) == key { return hint }
+    return lines.firstIndex { itemKey(parseLine($0)) == key }
 }
 
 func toggleTodo(at index: Int) -> Bool {
-    guard var lines = readTodoLines(), index >= 0, index < lines.count, let st = parseTodo(lines[index]) else { return false }
-    lines[index] = st.done ? stripOK(lines[index]) : stripOK(lines[index]) + "_OK"
-    // 已完成的沉到未完成之后（占用原有待办行位置）
-    var slots: [Int] = [], open: [String] = [], done: [String] = []
+    guard var lines = readTodoLines(), index >= 0, index < lines.count else { return false }
+    var L = parseLine(lines[index])
+    guard L.kind == .todo else { return false }
+    L.ok.toggle()
+    lines[index] = formatLine(L)
+    if cfg.sinkCompleted { sortByCompletion(&lines) }   // 默认不移动：已完成项留在原位
+    return writeTodoLines(lines)
+}
+
+/// 按任务文本切换完成状态（hint 只是行号提示，文件被改过也能找到正确的行）
+func toggleTodo(key: String, hint: Int) -> Bool {
+    guard let lines = readTodoLines(), let idx = findItemLine(lines, hint, key), parseLine(lines[idx]).kind == .todo else { return false }
+    return toggleTodo(at: idx)
+}
+
+/// 修改条目所在的行；fn 返回 false 表示删除该行
+@discardableResult
+func editItemLine(_ hint: Int, _ key: String, _ fn: (inout LineInfo) -> Bool) -> Bool {
+    guard var lines = readTodoLines(), let idx = findItemLine(lines, hint, key) else { return false }
+    var L = parseLine(lines[idx])
+    if fn(&L) { lines[idx] = formatLine(L) } else { lines.remove(at: idx) }
+    return writeTodoLines(lines)
+}
+
+/// 新建独立倒计时：放在已有倒计时之后；没有的话放在第一条待办 / 分组之前；都没有就追加到末尾
+func insertCountdownLine(_ name: String, _ due: Int, _ rep: Int) -> Bool {
+    guard var lines = readTodoLines() else { return false }
+    var C = LineInfo()
+    C.kind = .countdown; C.lead = "! "; C.text = name; C.hasDue = true; C.due = due; C.repeatSec = rep
+    var lastCd = -1, firstList = -1
     for (i, l) in lines.enumerated() {
-        guard let s = parseTodo(l) else { continue }
-        slots.append(i)
-        if s.done { done.append(l) } else { open.append(l) }
+        let L = parseLine(l)
+        if L.kind == .group { if firstList < 0 { firstList = i }; break }
+        if L.kind == .countdown { lastCd = i }
+        if L.kind == .todo && firstList < 0 { firstList = i }
     }
-    for (n, l) in (open + done).enumerated() { lines[slots[n]] = l }
+    var pos: Int
+    if lastCd >= 0 { pos = lastCd + 1 } else if firstList >= 0 { pos = firstList } else {
+        pos = lines.count
+        while pos > 0 && trimmed(lines[pos - 1]).isEmpty { pos -= 1 }
+    }
+    lines.insert(formatLine(C), at: pos)
     return writeTodoLines(lines)
 }
 
@@ -175,22 +416,21 @@ func processPlaceholders(_ s: String) -> String {
 func ensureDefaultTodo() {
     try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
     if !FileManager.default.fileExists(atPath: cfg.todoPath) {
-        let sample = "# {{TIME}}\n> {{DATE}}  {{WEEK}}\n- 项目：撰写结题报告\n- 论文：提升论文质量\n> 本周剩 {{DAYS_LEFT_WEEK}} · 本月剩 {{DAYS_LEFT_MONTH}} · 本年剩 {{DAYS_LEFT_YEAR}} 天\n"
+        let sample = "# {{TIME}}\n> {{DATE}}  {{WEEK}}\n## 工作\n- 项目：撰写结题报告\n- 论文：提升论文质量\n## 生活 _FOLD\n- 买菜\n##\n> 本周剩 {{DAYS_LEFT_WEEK}} · 本月剩 {{DAYS_LEFT_MONTH}} · 本年剩 {{DAYS_LEFT_YEAR}} 天\n"
         try? sample.write(toFile: cfg.todoPath, atomically: true, encoding: .utf8)
     }
 }
 
-// MARK: - Per-task timers（每项任务的倒计时 / 正计时）
+// MARK: - Stopwatch（每项任务的正计时）
 // 保存在 ~/Library/Application Support/DesktopTip/timers，与 Windows 版格式相同：
-// 每行 kind\tduration\tstart\taccum\tfired\t任务文本；kind = down(倒计时) / up(正计时)，
-// start 为本次开始计时的 Unix 秒（0 = 暂停中），accum 为此前累计的秒数。
+// 每行 kind\tduration\tstart\taccum\tfired\t任务文本；kind = up(正计时)。
+// 旧版的 down（倒计时）记录在启动时换算成截止时间写进 TODO 文件。
 
 let timersURL = supportDir.appendingPathComponent("timers")
-
-func nowEpoch() -> Int { Int(Date().timeIntervalSince1970) }
+let duesURL = supportDir.appendingPathComponent("deadlines")
 
 struct TaskTimer {
-    var countdown = true
+    var countdown = false
     var duration = 0
     var start = 0
     var accum = 0
@@ -221,24 +461,11 @@ func saveTaskTimers() {
     try? s.write(to: timersURL, atomically: true, encoding: .utf8)
 }
 
-func timerIndex(_ key: String) -> Int? { taskTimers.firstIndex { $0.key == key } }
+func timerIndex(_ key: String) -> Int? { taskTimers.firstIndex { $0.key == key && !$0.countdown } }
 func timer(for key: String) -> TaskTimer? { timerIndex(key).map { taskTimers[$0] } }
 
-func ensureTimer(_ key: String) -> Int {
-    if let i = timerIndex(key) { return i }
-    taskTimers.append(TaskTimer(key: key))
-    return taskTimers.count - 1
-}
-
-func startTaskCountdown(_ key: String, _ seconds: Int) {
-    let i = ensureTimer(key)
-    taskTimers[i].countdown = true; taskTimers[i].duration = seconds
-    taskTimers[i].accum = 0; taskTimers[i].start = nowEpoch(); taskTimers[i].fired = false
-    saveTaskTimers()
-}
-
 func startTaskStopwatch(_ key: String) {
-    let i = ensureTimer(key)
+    let i = timerIndex(key) ?? { taskTimers.append(TaskTimer(key: key)); return taskTimers.count - 1 }()
     taskTimers[i].countdown = false; taskTimers[i].duration = 0
     taskTimers[i].accum = 0; taskTimers[i].start = nowEpoch(); taskTimers[i].fired = false
     saveTaskTimers()
@@ -265,14 +492,94 @@ func removeTaskTimer(_ key: String) {
     saveTaskTimers()
 }
 
-/// 「再等 N 分钟」：倒计时延长到“从现在起还剩 N 秒”，并继续计时
-func snoozeTaskTimer(_ key: String, _ seconds: Int) {
-    guard let i = timerIndex(key) else { return }
-    let el = taskTimers[i].elapsed
-    taskTimers[i].countdown = true; taskTimers[i].duration = el + seconds
-    if taskTimers[i].start == 0 { taskTimers[i].start = nowEpoch() }
-    taskTimers[i].fired = false
+// MARK: - Deadline state（不写进 TODO 文件的部分）
+// ~/Library/Application Support/DesktopTip/deadlines，每行：due\tsetAt\tfired\t条目键（与 Windows 相同）
+
+struct DueMeta { var due: Int; var setAt: Int; var fired: Bool; var key: String; var seen = false }
+
+func keyForFile(_ k: String) -> String {
+    if isCountdownKey(k) { return "!C:" + k.dropFirst(2) }
+    if isGroupKey(k) { return "!G:" + k.dropFirst(2) }
+    return "T:" + k
+}
+func keyFromFile(_ s: String) -> String {
+    if s.hasPrefix("!C:") { return keyCDPrefix + s.dropFirst(3) }
+    if s.hasPrefix("!G:") { return keyGroupPrefix + s.dropFirst(3) }
+    if s.hasPrefix("T:") { return String(s.dropFirst(2)) }
+    return s
+}
+
+func loadDueMeta() -> [DueMeta] {
+    guard let d = FileManager.default.contents(atPath: duesURL.path) else { return [] }
+    var out: [DueMeta] = []
+    for line in splitLines(decodeText(d)) {
+        let p = line.components(separatedBy: "\t")
+        guard p.count >= 4, let due = Int(p[0]), let setAt = Int(p[1]) else { continue }
+        out.append(DueMeta(due: due, setAt: setAt, fired: p[2] == "1", key: keyFromFile(p[3...].joined(separator: "\t"))))
+    }
+    return out
+}
+
+var dueMeta: [DueMeta] = loadDueMeta()
+
+func saveDueMeta() {
+    let s = dueMeta.map { "\($0.due)\t\($0.setAt)\t\($0.fired ? 1 : 0)\t\(keyForFile($0.key))\n" }.joined()
+    try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+    try? s.write(to: duesURL, atomically: true, encoding: .utf8)
+}
+
+func dueMetaIndex(_ key: String, _ due: Int) -> Int? { dueMeta.firstIndex { $0.due == due && $0.key == key } }
+
+/// 通过界面设定截止时间后调用：进度环从现在开始走，且可以再次提醒
+func noteDueSet(_ key: String, _ due: Int) {
+    if let i = dueMetaIndex(key, due) { dueMeta[i].setAt = nowEpoch(); dueMeta[i].fired = false }
+    else { dueMeta.append(DueMeta(due: due, setAt: nowEpoch(), fired: false, key: key)) }
+    saveDueMeta()
+}
+
+func dueSetAt(_ key: String, _ due: Int) -> Int { dueMetaIndex(key, due).map { dueMeta[$0].setAt } ?? 0 }
+
+/// 旧版任务倒计时（timers 里的 down 记录）→ 换算成截止时间写进 TODO 文件
+func migrateLegacyCountdowns() {
+    guard taskTimers.contains(where: { $0.countdown }), var lines = readTodoLines() else { return }
+    let now = nowEpoch()
+    var changed = false
+    for t in taskTimers where t.countdown && !t.fired {
+        guard let idx = findItemLine(lines, -1, t.key) else { continue }
+        var L = parseLine(lines[idx])
+        guard L.kind == .todo, !L.hasDue, !L.ok else { continue }
+        L.hasDue = true; L.due = now + max(0, t.duration - t.elapsed); L.repeatSec = 0
+        lines[idx] = formatLine(L); changed = true
+        noteDueSet(t.key, L.due)
+    }
+    if changed && !writeTodoLines(lines) { return }
+    taskTimers.removeAll { $0.countdown }
     saveTaskTimers()
+}
+
+func setItemDue(_ hint: Int, _ key: String, _ due: Int, keepRepeat: Bool = true, repeatSec: Int = 0) {
+    let ok = editItemLine(hint, key) { L in
+        guard L.kind == .todo || L.kind == .countdown else { return true }
+        L.hasDue = true; L.due = due
+        if !keepRepeat { L.repeatSec = repeatSec }
+        return true
+    }
+    if ok { noteDueSet(key, due) }
+}
+
+/// 在 base 上加 months 个自然月（月末自动收拢）
+func addMonths(_ base: Int, _ months: Int) -> Int {
+    guard months > 0, let d = Calendar.current.date(byAdding: .month, value: months, to: Date(timeIntervalSince1970: TimeInterval(base))) else { return base }
+    return Int(d.timeIntervalSince1970)
+}
+
+/// 把 now → due 拆成 月 / 天 / 时 / 分 / 秒
+func splitRemain(_ now: Int, _ due: Int) -> [Int] {
+    guard due > now else { return [0, 0, 0, 0, 0] }
+    var months = 0
+    while months < 1200 && addMonths(now, months + 1) <= due { months += 1 }
+    let rest = max(0, due - addMonths(now, months))
+    return [months, rest / 86400, (rest % 86400) / 3600, (rest % 3600) / 60, rest % 60]
 }
 
 func formatClock(_ s: Int) -> String {
@@ -280,48 +587,29 @@ func formatClock(_ s: Int) -> String {
     return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%02d:%02d", m, sec)
 }
 
-func formatShortDuration(_ s: Int) -> String {
-    if s < 60 { return "\(s) 秒" }
-    if s % 60 != 0 { return "\(s / 60) 分 \(s % 60) 秒" }
-    let m = s / 60
-    if m < 60 { return "\(m) 分钟" }
-    return m % 60 == 0 ? "\(m / 60) 小时" : "\(m / 60) 小时 \(m % 60) 分钟"
+/// 剩余时长：< 1 天用时钟格式，>= 1 天用「N天 hh:mm」
+func formatRemain(_ s: Int) -> String {
+    let s = abs(s)
+    if s < 86400 { return formatClock(s) }
+    let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+    return d < 100 ? String(format: "%d天 %02d:%02d", d, h, m) : "\(d)天"
 }
 
-/// 分钟数，或 MM:SS / HH:MM:SS
-func parseDurationInput(_ v: String) -> Int? {
-    let parts = v.replacingOccurrences(of: "：", with: ":").split(separator: ":", omittingEmptySubsequences: false)
-        .map { Int($0.trimmingCharacters(in: .whitespaces)) }
-    guard parts.allSatisfy({ $0 != nil && $0! >= 0 }) else { return nil }
-    let p = parts.map { $0! }
-    var secs: Int?
-    switch p.count {
-    case 1: secs = p[0] * 60
-    case 2: secs = p[0] * 60 + p[1]
-    case 3: secs = p[0] * 3600 + p[1] * 60 + p[2]
-    default: break
-    }
-    if let s = secs, s > 0 { return s }
-    return nil
-}
-
-func todoKey(_ line: String) -> (key: String, done: Bool)? {
-    parseTodo(line).map { ($0.text.trimmingCharacters(in: .whitespaces), $0.done) }
-}
-
-/// 按任务文本切换完成状态（hint 只是行号提示，文件被改过也能找到正确的行）
-func toggleTodo(key: String, hint: Int) -> Bool {
-    guard let lines = readTodoLines() else { return false }
-    var idx = -1
-    if hint >= 0, hint < lines.count, todoKey(lines[hint])?.key == key { idx = hint }
-    else if let i = lines.firstIndex(where: { todoKey($0)?.key == key }) { idx = i }
-    return idx >= 0 && toggleTodo(at: idx)
+/// 截止时刻：今天 / 明天 / 今年内 / 更远
+func formatDueShort(_ due: Int) -> String {
+    let cal = Calendar.current
+    let d = Date(timeIntervalSince1970: TimeInterval(due)), now = Date()
+    let hm = makeFormatter("HH:mm").string(from: d)
+    if cal.isDateInToday(d) { return "今天 " + hm }
+    if cal.isDateInTomorrow(d) { return "明天 " + hm }
+    if cal.component(.year, from: d) == cal.component(.year, from: now) { return makeFormatter("MM-dd HH:mm").string(from: d) }
+    return makeFormatter("yyyy-MM-dd").string(from: d)
 }
 
 // MARK: - Animation / alert state
 
 let completeAnimSec = 0.70      // 完成动画
-let settleAnimSec = 0.32        // 已完成项沉底的滑动
+let settleAnimSec = 0.32        // 行位置变化时的滑动
 let shakeSec = 0.75             // 单次抖动
 let shakeRepeatSec = 6.0        // 未处理时每 6 秒再抖一次
 let shakeMaxTimes = 6
@@ -364,6 +652,10 @@ func lerpColor(_ a: NSColor, _ b: NSColor, _ t: Double) -> NSColor {
                    blue: x.blueComponent + (y.blueComponent - x.blueComponent) * t,
                    alpha: x.alphaComponent + (y.alphaComponent - x.alphaComponent) * t)
 }
+extension NSColor {
+    /// 在现有 alpha 上再乘一个系数（隐藏项淡显用）
+    func faded(_ f: Double) -> NSColor { withAlphaComponent(alphaComponent * CGFloat(f)) }
+}
 
 let accentDone = rgb(52, 211, 153)    // 完成：翡翠绿
 let accentGold = rgb(253, 224, 71)
@@ -371,6 +663,7 @@ let coral = rgb(255, 107, 107)        // 到点：珊瑚红
 let amber = rgb(251, 191, 36)         // 快到点：琥珀
 let sky = rgb(125, 211, 252)          // 倒计时：天蓝
 let violet = rgb(196, 181, 253)       // 正计时：淡紫
+func toneColor(_ t: Int) -> NSColor { t == 2 ? coral : t == 1 ? amber : t == 3 ? violet : sky }
 
 // MARK: - Fonts
 
@@ -385,11 +678,11 @@ func makeBoldFont(_ family: String, _ size: CGFloat) -> NSFont {
     return NSFont.systemFont(ofSize: size, weight: .semibold)
 }
 
-/// 对勾（按路径长度比例 t 逐步描绘）；box 为复选框在翻转坐标中的原点
+/// 对勾（按路径长度比例 t 逐步描绘）；(x, y) 为复选框在翻转坐标中的原点
 func drawTick(_ x: CGFloat, _ y: CGFloat, _ d: CGFloat, _ t: Double, _ color: NSColor, _ width: CGFloat) {
     guard t > 0 else { return }
-    let p0 = NSPoint(x: x + d * 0.23, y: y + d * 0.53), p1 = NSPoint(x: x + d * 0.43, y: y + d * 0.72)
-    let p2 = NSPoint(x: x + d * 0.78, y: y + d * 0.28)
+    let p0 = NSPoint(x: x + d * 0.27, y: y + d * 0.52), p1 = NSPoint(x: x + d * 0.44, y: y + d * 0.68)
+    let p2 = NSPoint(x: x + d * 0.74, y: y + d * 0.34)
     let l1 = hypot(p1.x - p0.x, p1.y - p0.y), l2 = hypot(p2.x - p1.x, p2.y - p1.y)
     let len = (l1 + l2) * CGFloat(clamp01(t))
     let path = NSBezierPath()
@@ -406,9 +699,11 @@ func drawTick(_ x: CGFloat, _ y: CGFloat, _ d: CGFloat, _ t: Double, _ color: NS
     color.setStroke(); path.stroke()
 }
 
+func digitsTo8(_ s: String) -> String { String(s.map { $0.isASCII && $0.isNumber ? "8" : $0 }) }
+
 // MARK: - Card view
 
-enum RowType { case spacer, heading, meta, todo }
+enum RowType { case spacer, heading, meta, todo, countdown, group }
 struct Row {
     var type: RowType
     var text = ""
@@ -416,10 +711,28 @@ struct Row {
     var tw: CGFloat = 0          // 纯文字宽度（删除线动画用）
     var source = -1
     var done = false
-    var key = ""                 // 待办原始文本（计时器的键）
+    var key = ""                 // 条目键
+    var seg = 0                  // 所在段（分组）
+    var depth = 0                // 嵌套深度（缩进）
+    var fade = 1.0               // 隐藏项淡显
+    var hasDue = false
+    var due = 0
+    // 分组
+    var folded = false
+    var openCount = 0
+    var nearestDue = 0
+    var summary = ""
+    // 计时胶囊
+    var pill = false
+    var pillDue = false
+    var pillRunning = true
+    var pillExpired = false
+    var pillFrac = 0.0
+    var pillTone = 0             // 0 常态 / 1 快到点 / 2 已到点 / 3 正计时
+    var pillLabel = ""
 }
 
-struct HitRect { var rect: NSRect; var source: Int; var key: String; var done: Bool }
+struct HitRect { var rect: NSRect; var source: Int; var key: String; var done: Bool; var kind = 0 }
 
 final class CardView: NSView {
     static let margin: (CGFloat) -> CGFloat = { $0 * 2.1 }
@@ -427,13 +740,13 @@ final class CardView: NSView {
     var dividerY: CGFloat = -1
     var cardSize = NSSize(width: 100, height: 60)
     var hitRects: [HitRect] = []          // 复选框
-    var rowRects: [HitRect] = []          // 整行（右键设置计时）
-    var pillRects: [HitRect] = []         // 计时胶囊（单击暂停/继续）
+    var rowRects: [HitRect] = []          // 整行（右键菜单）
+    var pillRects: [HitRect] = []         // 计时胶囊
+    var groupRects: [HitRect] = []        // 分组标题（单击折叠/展开）
     var bannerButtons: [(rect: NSRect, action: BannerAction)] = []
-    var lastSignature = ""
+    var hasDuePill = false
     weak var controller: AppController?
 
-    // 布局结果（计时胶囊列 / 提醒横幅）
     var pillColW: CGFloat = 0
     var bannerH: CGFloat = 0, bannerY: CGFloat = 0, bHeadBlock: CGFloat = 0, bTitleH: CGFloat = 0, bDetailH: CGFloat = 0
     var btnSpec: [(action: BannerAction, title: String)] = []
@@ -447,20 +760,24 @@ final class CardView: NSView {
     var M: CGFloat { CardView.margin(base) }
 
     // 尺寸常量（随字号缩放）
-    var pillH: CGFloat { base * 1.08 }
-    var ringD: CGFloat { pillH * 0.56 }
-    var pillPadX: CGFloat { base * 0.40 }
-    var pillInnerGap: CGFloat { base * 0.30 }
+    var checkD: CGFloat { max(12, (base * 0.62).rounded(.towardZero)) }
+    var checkGap: CGFloat { (base * 0.50).rounded(.towardZero) }
+    var indentStep: CGFloat { base * 0.95 }
+    var pillH: CGFloat { base * 1.0 }
+    var ringD: CGFloat { base * 0.62 }
+    var pillPadX: CGFloat { base * 0.34 }
+    var pillInnerGap: CGFloat { base * 0.28 }
     var pillGap: CGFloat { base * 0.75 }
-    var bPad: CGFloat { base * 0.62 }
-    var iconD: CGFloat { base * 1.5 }
-    var btnH: CGFloat { base * 1.25 }
-    var btnPadX: CGFloat { base * 0.72 }
-    var btnGap: CGFloat { base * 0.36 }
-    var timerFont: NSFont { NSFont.monospacedDigitSystemFont(ofSize: base * 0.66, weight: .regular) }
-    var bTitleFont: NSFont { makeBoldFont(cfg.fontFamily, base * 0.88) }
-    var bDetailFont: NSFont { makeFont(cfg.fontFamily, base * 0.64) }
-    var btnFont: NSFont { makeBoldFont(cfg.fontFamily, base * 0.58) }
+    var bPad: CGFloat { base * 0.60 }
+    var iconD: CGFloat { base * 1.30 }
+    var btnH: CGFloat { base * 1.15 }
+    var btnPadX: CGFloat { base * 0.70 }
+    var btnGap: CGFloat { base * 0.30 }
+    var timerFont: NSFont { NSFont.monospacedDigitSystemFont(ofSize: base * 0.64, weight: .regular) }
+    var groupFont: NSFont { makeBoldFont(cfg.fontFamily, base * 0.66) }
+    var bTitleFont: NSFont { makeBoldFont(cfg.fontFamily, base * 0.84) }
+    var bDetailFont: NSFont { makeFont(cfg.fontFamily, base * 0.62) }
+    var btnFont: NSFont { makeFont(cfg.fontFamily, base * 0.58) }
 
     func attrs(_ font: NSFont, color: NSColor, strike: Bool = false) -> [NSAttributedString.Key: Any] {
         var a: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
@@ -470,69 +787,158 @@ final class CardView: NSView {
 
     func textSize(_ s: String, _ f: NSFont) -> NSSize { NSAttributedString(string: s, attributes: [.font: f]).size() }
 
+    func dueLabel(_ due: Int) -> String {
+        let rem = due - nowEpoch()
+        if cfg.dueShowAbsolute { return formatDueShort(due) }
+        return rem > 0 ? formatRemain(rem) : "+" + formatRemain(-rem)
+    }
+
+    /// 读文件 → 多级分组 / 折叠 / 隐藏 / _SHOW → 行模型
+    func buildRows(_ raw: [String], ok: Bool) -> [Row] {
+        var rs: [Row] = []
+        struct Frame { var level: Int; var row: Int; var hidden: Bool; var folded: Bool; var fade: Double }
+        var stack: [Frame] = []
+        var seg = 0
+        func popTo(_ level: Int) { while let l = stack.last, l.level >= level { stack.removeLast() } }
+        func ancestors() -> (hidden: Bool, folded: Bool, fade: Double, summaryRow: Int) {
+            var h = false, f = false, fd = 1.0, sr = -1
+            for fr in stack {
+                if fr.hidden { h = true }
+                if fr.folded { if !f && !h && fr.row >= 0 { sr = fr.row }; f = true }
+                fd *= fr.fade
+            }
+            return (h, f, fd, sr)
+        }
+        for (i, line) in raw.enumerated() {
+            var r = Row(type: .spacer)
+            r.source = ok ? i : -1
+            if !ok { r.type = .meta; r.text = line; rs.append(r); continue }
+            let L = parseLine(line)
+            if L.kind == .groupEnd { popTo(L.level); seg += 1; continue }
+            if L.kind == .heading { stack.removeAll(); seg += 1 }
+            if L.kind == .group {
+                popTo(L.level)
+                let a = ancestors()
+                let blocked = (a.hidden && !cfg.showHidden) || a.folded
+                seg += 1
+                var fr = Frame(level: L.level, row: -1, hidden: L.hide, folded: L.fold, fade: L.hide ? 0.42 : 1)
+                if !blocked && !(L.hide && !cfg.showHidden) {
+                    r.type = .group
+                    r.text = processPlaceholders(L.text)
+                    if r.text.isEmpty { r.text = "未命名分组" }
+                    r.key = itemKey(L); r.folded = L.fold
+                    r.fade = a.fade * fr.fade; r.seg = seg; r.depth = stack.count
+                    rs.append(r)
+                    fr.row = rs.count - 1
+                }
+                stack.append(fr)
+                continue
+            }
+            let a = ancestors()
+            let blocked = (a.hidden && !cfg.showHidden) || a.folded
+            let isItem = L.kind == .todo || L.kind == .countdown
+            let selfHidden = L.hide && !cfg.showHidden
+            let pinned = isItem && L.show && !selfHidden     // _SHOW：分组折叠或隐藏时仍显示
+            if (blocked && !pinned) || selfHidden {
+                if a.folded, a.summaryRow >= 0, isItem, !L.ok, !L.hide {
+                    if L.kind == .todo { rs[a.summaryRow].openCount += 1 }
+                    if L.hasDue, rs[a.summaryRow].nearestDue == 0 || L.due < rs[a.summaryRow].nearestDue { rs[a.summaryRow].nearestDue = L.due }
+                }
+                continue
+            }
+            r.seg = seg; r.depth = stack.count
+            r.fade = (pinned && blocked ? 1 : a.fade) * (L.hide ? 0.42 : 1)
+            switch L.kind {
+            case .blank: r.type = .spacer
+            case .heading: r.type = .heading; r.text = processPlaceholders(L.text); r.depth = 0
+            case .meta: r.type = .meta; r.text = processPlaceholders(L.text)
+            case .countdown:
+                r.type = .countdown
+                r.text = processPlaceholders(trimmed(L.text)); if r.text.isEmpty { r.text = "倒计时" }
+                r.key = itemKey(L); r.done = L.ok; r.hasDue = true; r.due = L.due
+            default:
+                r.type = .todo
+                r.text = processPlaceholders(L.text)
+                r.key = itemKey(L); r.done = L.ok; r.hasDue = L.hasDue; r.due = L.due
+            }
+            rs.append(r)
+        }
+        // 开启「已完成项沉底」时：已完成排在后面（只在同一段内）
+        if cfg.sinkCompleted {
+            var bySeg: [Int: [Int]] = [:]
+            for i in rs.indices where rs[i].type == .todo { bySeg[rs[i].seg, default: []].append(i) }
+            for (_, slots) in bySeg {
+                let sorted = slots.map { rs[$0] }.enumerated().sorted { a, b in
+                    a.element.done != b.element.done ? !a.element.done : a.offset < b.offset
+                }.map { $0.element }
+                for (n, ix) in slots.enumerated() { rs[ix] = sorted[n] }
+            }
+        }
+        return rs
+    }
+
     /// Rebuilds rows and layout; returns the full window size.
     func relayout() -> NSSize {
         let base = self.base
         let fileLines = readTodoLines()
-        var raw = fileLines ?? ["Error: Unable to open file!"]
-        if fileLines == nil { raw = ["Error: Unable to open file!"] }
         let ok = fileLines != nil
+        var rs = buildRows(fileLines ?? ["Error: Unable to open file!"], ok: ok)
+        let now = nowEpoch()
 
-        var rs: [Row] = []
-        for (i, line) in raw.enumerated() {
-            let t = String(trimRight(line).drop(while: { $0 == " " || $0 == "\t" }))
-            var r = Row(type: .spacer)
-            r.source = ok ? i : -1
-            func body(_ s: String) -> String { processPlaceholders(String(s.dropFirst(s.dropFirst().first == " " ? 2 : 1))) }
-            if t.isEmpty { r.type = .spacer }
-            else if t.first == "#" { r.type = .heading; r.text = body(t) }
-            else if t.first == ">" { r.type = .meta; r.text = body(t) }
-            else if let st = parseTodo(line) {
-                r.type = ok ? .todo : .meta
-                r.text = processPlaceholders(st.text.isEmpty && !ok ? line : st.text)
-                r.done = st.done
-                r.key = st.text.trimmingCharacters(in: .whitespaces)
-            }
-            rs.append(r)
-        }
-        // 已完成排在后面（与文件内的排序一致，容错手工编辑）
-        let todos = rs.filter { $0.type == .todo }.enumerated().sorted { a, b in
-            a.element.done != b.element.done ? !a.element.done : a.offset < b.offset
-        }.map { $0.element }
-        var k = 0
-        for i in rs.indices where rs[i].type == .todo { rs[i] = todos[k]; k += 1 }
-
-        let headSz = base * 2.0, metaSz = base * 0.64
-        let fHead = makeFont(cfg.fontFamily, headSz, light: true)
+        let fHead = makeFont(cfg.fontFamily, base * 2.0, light: true)
         let fText = makeFont(cfg.fontFamily, base)
-        let fMeta = makeFont(cfg.fontFamily, metaSz)
+        let fMeta = makeFont(cfg.fontFamily, base * 0.64)
 
         let PADX = (base * 1.15).rounded(.towardZero), PADTOP = (base * 0.95).rounded(.towardZero), PADBOT = (base * 1.05).rounded(.towardZero)
-        let checkD = max(11, (base * 0.58).rounded(.towardZero)), checkGap = (base * 0.52).rounded(.towardZero)
         let divGap = (base * 0.80).rounded(.towardZero), metaGap = (base * 0.28).rounded(.towardZero), headGap = (base * 0.12).rounded(.towardZero)
+        let groupGapTop = (base * 0.62).rounded(.towardZero), groupGapBot = (base * 0.30).rounded(.towardZero)
         let todoExtra = CGFloat(max(0, cfg.lineHeight - cfg.fontHeight))
         let todoGap = (base * 0.45).rounded(.towardZero) + todoExtra
 
-        // 计时胶囊：同一列右对齐，宽度按模板测量，数字变化时不抖动
+        // 计时胶囊内容：截止时间优先；任务完成后只保留正计时的最终用时
         var pw: CGFloat = 0
-        for r in rs where r.type == .todo {
-            guard let t = timer(for: r.key) else { continue }
-            let el = t.elapsed
-            let span = t.countdown ? max(t.duration, el - t.duration) : el
-            let tw = ceil(textSize(span >= 3600 ? "+88:88:88" : "+88:88", timerFont).width)
-            pw = max(pw, pillPadX * 2 + ringD + pillInnerGap + tw)
+        hasDuePill = false
+        for i in rs.indices {
+            if rs[i].type == .group && rs[i].folded {
+                var s = rs[i].openCount > 0 ? "\(rs[i].openCount) 项" : ""
+                if rs[i].nearestDue > 0 { s += (s.isEmpty ? "" : "  ·  ") + dueLabel(rs[i].nearestDue); hasDuePill = true }
+                rs[i].summary = s
+                continue
+            }
+            guard rs[i].type == .todo || rs[i].type == .countdown else { continue }
+            if rs[i].hasDue && !rs[i].done {
+                let rem = rs[i].due - now
+                let setAt = dueSetAt(rs[i].key, rs[i].due)
+                let total = (setAt > 0 && rs[i].due > setAt) ? rs[i].due - setAt : 0
+                rs[i].pill = true; rs[i].pillDue = true; rs[i].pillRunning = true
+                rs[i].pillExpired = rem <= 0
+                rs[i].pillFrac = rem <= 0 ? 1 : (total > 0 ? clamp01(Double(rem) / Double(total)) : 1)
+                rs[i].pillTone = rem <= 0 ? 2 : ((rem <= 60 || (total > 0 && rem * 5 <= total)) ? 1 : 0)
+                rs[i].pillLabel = dueLabel(rs[i].due)
+                hasDuePill = true
+            } else if rs[i].type == .todo, let t = timer(for: rs[i].key) {
+                rs[i].pill = true; rs[i].pillDue = false; rs[i].pillRunning = t.running
+                rs[i].pillFrac = Double(t.elapsed % 60) / 60
+                rs[i].pillTone = 3
+                rs[i].pillLabel = formatClock(t.elapsed)
+            }
+            if rs[i].pill {
+                pw = max(pw, pillPadX * 2 + ringD + pillInnerGap + ceil(textSize(digitsTo8(rs[i].pillLabel), timerFont).width))
+            }
         }
         pillColW = pw
 
         var contentW = base * 4
         for i in rs.indices {
             if rs[i].type == .spacer { rs[i].h = base * 0.45; continue }
-            let f = rs[i].type == .heading ? fHead : rs[i].type == .meta ? fMeta : fText
+            let f = rs[i].type == .heading ? fHead : rs[i].type == .meta ? fMeta : rs[i].type == .group ? groupFont : fText
             let sz = textSize(rs[i].text, f)
             rs[i].h = ceil(sz.height)
             rs[i].tw = ceil(sz.width)
-            rs[i].w = ceil(sz.width) + (rs[i].type == .todo ? checkD + checkGap : 0)
-            if rs[i].type == .todo, pillColW > 0, timer(for: rs[i].key) != nil { rs[i].w += pillGap + pillColW }
+            rs[i].w = ceil(sz.width) + CGFloat(rs[i].depth) * indentStep
+            if [.todo, .countdown, .group].contains(rs[i].type) { rs[i].w += checkD + checkGap }
+            if rs[i].pill { rs[i].w += pillGap + pillColW }
+            if rs[i].type == .group, !rs[i].summary.isEmpty { rs[i].w += pillGap + ceil(textSize(digitsTo8(rs[i].summary), fMeta).width) }
             contentW = max(contentW, rs[i].w)
         }
 
@@ -549,27 +955,32 @@ final class CardView: NSView {
             }
             btnsW += btnGap * CGFloat(max(0, btnSpec.count - 1))
             let need = max(bPad + iconD + bPad * 0.8 + max(ts.width, ds.width) + bPad, bPad * 2 + btnsW)
-            bHeadBlock = max(iconD, bTitleH + base * 0.12 + bDetailH)
-            bannerH = bPad + bHeadBlock + base * 0.6 + btnH + bPad
+            bHeadBlock = max(iconD, bTitleH + base * 0.10 + bDetailH)
+            bannerH = bPad + bHeadBlock + base * 0.55 + btnH + bPad
             contentW = max(contentW, ceil(need))
         }
 
-        var y = PADTOP, divY: CGFloat = -1, placed = false, seen = ui.alertActive, lastGap: CGFloat = 0
+        var y = PADTOP, divY: CGFloat = -1, placed = false, seen = ui.alertActive, seenList = false, lastGap: CGFloat = 0
         bannerY = PADTOP
         if ui.alertActive { y += bannerH + base * 0.85 }
         for i in rs.indices {
             if rs[i].type == .spacer { y += rs[i].h; lastGap = 0; continue }
-            if rs[i].type == .todo, !placed {
+            let listRow = [.todo, .countdown, .group].contains(rs[i].type)
+            if listRow && !placed {
                 if seen { y += divGap; divY = y; y += 1 + divGap }
                 placed = true
+            } else if rs[i].type == .group && seenList {
+                y += groupGapTop - lastGap * 0.5
             }
             rs[i].y = y
             switch rs[i].type {
             case .heading: y += rs[i].h + headGap; lastGap = headGap
             case .meta: y += rs[i].h + metaGap; lastGap = metaGap
+            case .group: y += rs[i].h + groupGapBot; lastGap = groupGapBot
             default: y += max(rs[i].h, checkD) + todoGap; lastGap = todoGap
             }
             seen = true
+            if listRow { seenList = true }
         }
         y -= lastGap
         var cardW = contentW + PADX * 2, cardH = y + PADBOT
@@ -598,7 +1009,7 @@ final class CardView: NSView {
         let sh = NSShadow()
         sh.shadowBlurRadius = min(56, max(8, base * 0.95))
         sh.shadowOffset = NSSize(width: 0, height: -base * 0.35)
-        sh.shadowColor = NSColor.black.withAlphaComponent(0.5)
+        sh.shadowColor = NSColor.black.withAlphaComponent(0.45)
         sh.set()
         NSColor.black.setFill()
         cardPath.fill()
@@ -606,6 +1017,9 @@ final class CardView: NSView {
 
         cfg.bgColor.withAlphaComponent(CGFloat(cfg.bgAlpha) / 255).setFill()
         cardPath.fill()
+        // 顶部微光
+        NSGradient(starting: NSColor.white.withAlphaComponent(0.06), ending: NSColor.white.withAlphaComponent(0))?
+            .draw(in: cardPath, angle: 90)
         NSColor.white.withAlphaComponent(0.1).setStroke()
         cardPath.lineWidth = 1
         cardPath.stroke()
@@ -613,12 +1027,12 @@ final class CardView: NSView {
         // 提醒中：卡片边缘呼吸光
         if ui.alertActive {
             for k in stride(from: 3, through: 1, by: -1) {
-                coral.withAlphaComponent(CGFloat((22 + 34 * pulse) * Double(4 - k) / 3 / 255)).setStroke()
+                coral.withAlphaComponent(CGFloat((18 + 30 * pulse) * Double(4 - k) / 3 / 255)).setStroke()
                 cardPath.lineWidth = CGFloat(k) * 2.2
                 cardPath.stroke()
             }
-            rgb(255, 128, 112, CGFloat((110 + 120 * pulse) / 255)).setStroke()
-            cardPath.lineWidth = 1.6
+            rgb(255, 128, 112, CGFloat((90 + 110 * pulse) / 255)).setStroke()
+            cardPath.lineWidth = 1.4
             cardPath.stroke()
         }
 
@@ -626,88 +1040,74 @@ final class CardView: NSView {
         func scaled(_ k: CGFloat, _ a: CGFloat) -> NSColor {
             NSColor(srgbRed: tc.redComponent * k, green: tc.greenComponent * k, blue: tc.blueComponent * k, alpha: a)
         }
-        let ink = tc, checkc = tc.withAlphaComponent(0.92)
-        let doneInk = scaled(0.55, 0.6), doneCheck = scaled(0.52, 0.65), doneFill = scaled(0.45, 0.14)
-        let metaC = NSColor(srgbRed: 169 / 255, green: 175 / 255, blue: 189 / 255, alpha: 1)
+        let ink = tc, checkc = tc.withAlphaComponent(0.78)
+        let doneInk = scaled(0.62, 0.6), doneCheck = scaled(0.58, 0.6), doneFill = scaled(0.5, 0.16)
+        let metaC = rgb(160, 167, 182)
+        let groupInk = lerpColor(metaC, ink, 0.3)
         let fHead = makeFont(cfg.fontFamily, base * 2, light: true), fText = makeFont(cfg.fontFamily, base)
         let fMeta = makeFont(cfg.fontFamily, base * 0.64)
         let PADX = (base * 1.15).rounded(.towardZero)
-        let checkD = max(11, (base * 0.58).rounded(.towardZero)), checkGap = (base * 0.52).rounded(.towardZero)
+        let checkD = self.checkD, checkGap = self.checkGap
         let sdy = max(1, base * 0.045)
+        let stroke = max(1.2, base * 0.058)
+        let nowE = nowEpoch()
 
         func drawText(_ s: String, _ f: NSFont, _ x: CGFloat, _ y: CGFloat, _ c: NSColor, strike: Bool = false) {
             if s.isEmpty { return }
-            NSAttributedString(string: s, attributes: attrs(f, color: NSColor.black.withAlphaComponent(0.35 * c.alphaComponent), strike: strike))
+            NSAttributedString(string: s, attributes: attrs(f, color: NSColor.black.withAlphaComponent(0.32 * c.alphaComponent), strike: strike))
                 .draw(at: NSPoint(x: x, y: y + sdy))
             NSAttributedString(string: s, attributes: attrs(f, color: c, strike: strike)).draw(at: NSPoint(x: x, y: y))
+        }
+        func circle(_ cx: CGFloat, _ cy: CGFloat, _ r: CGFloat) -> NSBezierPath {
+            NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
         }
 
         let bx = M + PADX
         let rightX = M + cardSize.width - PADX
         if dividerY >= 0 {
-            NSColor.white.withAlphaComponent(0.12).setStroke()
-            let p = NSBezierPath()
-            p.move(to: NSPoint(x: bx, y: M + dividerY + 0.5)); p.line(to: NSPoint(x: rightX, y: M + dividerY + 0.5))
-            p.lineWidth = 1; p.stroke()
+            NSGradient(starting: NSColor.white.withAlphaComponent(0.14), ending: NSColor.white.withAlphaComponent(0))?
+                .draw(in: NSRect(x: bx, y: M + dividerY, width: rightX - bx, height: 1), angle: 0)
         }
 
-        // ---- 提醒横幅 ----
+        // ---- 提醒横幅：卡片色调的玻璃面板 + 珊瑚色描边 ----
         bannerButtons.removeAll()
         if ui.alertActive {
             let e = easeOutCubic(alertT / 0.38)                     // 入场：下滑 + 淡入
             let A = CGFloat(e)
             let bw = rightX - bx
             let byT = M + bannerY - CGFloat(1 - e) * base * 0.6
-            let br = base * 0.55
-            for k in 1...3 {                                         // 外圈呼吸光
-                let kk = CGFloat(k) * 1.6
-                let gp = NSBezierPath(roundedRect: NSRect(x: bx - kk, y: byT - kk, width: bw + kk * 2, height: bannerH + kk * 2),
-                                      xRadius: br + kk, yRadius: br + kk)
-                rgb(255, 120, 100, CGFloat(e * (40 + 60 * pulse) / Double(k) / 255)).setStroke()
-                gp.lineWidth = 1.6; gp.stroke()
-            }
+            let br = base * 0.5
             let bp = NSBezierPath(roundedRect: NSRect(x: bx, y: byT, width: bw, height: bannerH), xRadius: br, yRadius: br)
-            NSGradient(starting: rgb(255, 95, 109, 0.96 * A), ending: rgb(255, 166, 77, 0.96 * A))?.draw(in: bp, angle: 18)
-            let hp = NSBezierPath(roundedRect: NSRect(x: bx + 1, y: byT + 1, width: bw - 2, height: bannerH - 2), xRadius: br - 1, yRadius: br - 1)
-            NSColor.white.withAlphaComponent(0.25 * A).setStroke(); hp.lineWidth = 1; hp.stroke()
+            coral.withAlphaComponent(A * CGFloat(0.10 + 0.05 * pulse)).setFill(); bp.fill()
+            rgb(255, 128, 112, A * CGFloat(0.45 + 0.25 * pulse)).setStroke(); bp.lineWidth = 1.2; bp.stroke()
 
-            // 闹钟图标（抖动时轻轻摇摆）
+            // 图标：细线圆环 + 指针（抖动时轻轻摇摆）
             let icx = bx + bPad + iconD / 2, icy = byT + bPad + bHeadBlock / 2
             var wig = 0.0
             if ui.shaking {
                 let st = now.timeIntervalSince(ui.shakeStart)
-                wig = 18 * sin(st * 2 * .pi * 6) * (1 - clamp01(st / shakeSec))
+                wig = 16 * sin(st * 2 * .pi * 6) * (1 - clamp01(st / shakeSec))
             }
             NSGraphicsContext.saveGraphicsState()
             let xf = NSAffineTransform()
             xf.translateX(by: icx, yBy: icy)
             xf.rotate(byDegrees: CGFloat(wig))
             xf.concat()
-            NSColor.white.withAlphaComponent(0.24 * A).setFill()
-            NSBezierPath(ovalIn: NSRect(x: -iconD / 2, y: -iconD / 2, width: iconD, height: iconD)).fill()
-            let cr = iconD * 0.25, sw = max(1.4, base * 0.075), cyo = iconD * 0.05
-            NSColor.white.withAlphaComponent(A).setStroke()
-            func stroked(_ p: NSBezierPath) { p.lineWidth = sw; p.lineCapStyle = .round; p.stroke() }
-            stroked(NSBezierPath(ovalIn: NSRect(x: -cr, y: cyo - cr, width: cr * 2, height: cr * 2)))
+            coral.withAlphaComponent(0.18 * A).setFill()
+            circle(0, 0, iconD / 2).fill()
+            let cr = iconD * 0.26, sw = max(1.3, base * 0.065)
+            rgb(255, 150, 140, A).setStroke()
+            let ring = circle(0, 0, cr); ring.lineWidth = sw; ring.stroke()
             let hands = NSBezierPath()
-            hands.move(to: NSPoint(x: 0, y: cyo - cr * 0.55)); hands.line(to: NSPoint(x: 0, y: cyo))
-            hands.line(to: NSPoint(x: cr * 0.42, y: cyo + cr * 0.22))
-            stroked(hands)
-            let er = cr * 0.48
-            let earL = NSBezierPath(); earL.appendArc(withCenter: NSPoint(x: -cr * 0.85, y: cyo - cr * 0.95), radius: er, startAngle: 190, endAngle: 290, clockwise: false)
-            let earR = NSBezierPath(); earR.appendArc(withCenter: NSPoint(x: cr * 0.85, y: cyo - cr * 0.95), radius: er, startAngle: 250, endAngle: 350, clockwise: false)
-            stroked(earL); stroked(earR)
-            let feet = NSBezierPath()
-            feet.move(to: NSPoint(x: -cr * 0.62, y: cyo + cr * 0.86)); feet.line(to: NSPoint(x: -cr * 0.86, y: cyo + cr * 1.14))
-            feet.move(to: NSPoint(x: cr * 0.62, y: cyo + cr * 0.86)); feet.line(to: NSPoint(x: cr * 0.86, y: cyo + cr * 1.14))
-            stroked(feet)
+            hands.move(to: NSPoint(x: 0, y: -cr * 0.58)); hands.line(to: .zero); hands.line(to: NSPoint(x: cr * 0.42, y: cr * 0.24))
+            hands.lineWidth = sw; hands.lineCapStyle = .round; hands.lineJoinStyle = .round; hands.stroke()
             NSGraphicsContext.restoreGraphicsState()
 
             let tx = bx + bPad + iconD + bPad * 0.8
-            let ty = byT + bPad + (bHeadBlock - (bTitleH + base * 0.12 + bDetailH)) / 2
-            NSAttributedString(string: ui.alertTitle, attributes: attrs(bTitleFont, color: NSColor.white.withAlphaComponent(A))).draw(at: NSPoint(x: tx, y: ty))
-            NSAttributedString(string: ui.alertDetail, attributes: attrs(bDetailFont, color: NSColor.white.withAlphaComponent(0.88 * A)))
-                .draw(at: NSPoint(x: tx, y: ty + bTitleH + base * 0.12))
+            let ty = byT + bPad + (bHeadBlock - (bTitleH + base * 0.10 + bDetailH)) / 2
+            NSAttributedString(string: ui.alertTitle, attributes: attrs(bTitleFont, color: ink.withAlphaComponent(A))).draw(at: NSPoint(x: tx, y: ty))
+            NSAttributedString(string: ui.alertDetail, attributes: attrs(bDetailFont, color: metaC.withAlphaComponent(0.95 * A)))
+                .draw(at: NSPoint(x: tx, y: ty + bTitleH + base * 0.10))
 
             // 按钮（右对齐；第一个为主按钮）
             let byB = byT + bannerH - bPad - btnH
@@ -716,10 +1116,10 @@ final class CardView: NSView {
                 cx -= btnW[i]
                 let primary = i == 0
                 let r = NSRect(x: cx, y: byB, width: btnW[i], height: btnH)
-                (primary ? NSColor.white.withAlphaComponent(0.96 * A) : NSColor.white.withAlphaComponent(0.22 * A)).setFill()
+                (primary ? coral.withAlphaComponent(0.92 * A) : tc.withAlphaComponent(0.10 * A)).setFill()
                 NSBezierPath(roundedRect: r, xRadius: btnH / 2, yRadius: btnH / 2).fill()
                 let label = NSAttributedString(string: btnSpec[i].title,
-                                               attributes: attrs(btnFont, color: primary ? rgb(225, 72, 82, A) : NSColor.white.withAlphaComponent(A)))
+                                               attributes: attrs(btnFont, color: primary ? NSColor.white.withAlphaComponent(A) : ink.withAlphaComponent(0.9 * A)))
                 let ls = label.size()
                 label.draw(at: NSPoint(x: r.midX - ls.width / 2, y: r.midY - ls.height / 2))
                 bannerButtons.append((r, btnSpec[i].action))
@@ -728,143 +1128,158 @@ final class CardView: NSView {
         }
 
         // ---- 各行 ----
-        hitRects.removeAll(); rowRects.removeAll(); pillRects.removeAll()
+        hitRects.removeAll(); rowRects.removeAll(); pillRects.removeAll(); groupRects.removeAll()
         var rowY: [String: CGFloat] = [:]
         let settleT = ui.settling ? easeOutCubic(now.timeIntervalSince(ui.settleStart) / settleAnimSec) : 1
         let animP = ui.animKey != nil ? clamp01(now.timeIntervalSince(ui.animStart) / completeAnimSec) : 0
 
         for r in rows {
             var ry = M + r.y
+            let fd = r.fade
             switch r.type {
             case .spacer: continue
-            case .heading: drawText(r.text, fHead, bx, ry, ink); continue
-            case .meta: drawText(r.text, fMeta, bx, ry, metaC); continue
-            case .todo: break
+            case .heading: drawText(r.text, fHead, bx, ry, ink.faded(fd)); continue
+            case .meta: drawText(r.text, fMeta, bx + CGFloat(r.depth) * indentStep, ry, metaC.faded(fd)); continue
+            default: break
             }
-            // 已完成项沉底时，从旧位置平滑滑到新位置
-            if ui.settling, let from = ui.settleFrom[r.key] { ry = M + from + (r.y - from) * CGFloat(settleT) }
-            if rowY[r.key] == nil { rowY[r.key] = ry - M }
+            // 行位置变化（完成沉底 / 折叠展开 / 隐藏）时，从旧位置平滑滑到新位置
+            if ui.settling, !r.key.isEmpty, let from = ui.settleFrom[r.key] { ry = M + from + (r.y - from) * CGFloat(settleT) }
+            if !r.key.isEmpty, rowY[r.key] == nil { rowY[r.key] = ry - M }
 
             let rh = max(r.h, checkD)
             let cy = ry + rh / 2 - checkD / 2
-            let stroke = max(1.25, base * 0.06)
-            let box = NSRect(x: bx, y: cy, width: checkD, height: checkD)
-            let textX = bx + checkD + checkGap
-            let rowRect = NSRect(x: bx - base * 0.35, y: ry - base * 0.22, width: rightX - bx + base * 0.7, height: rh + base * 0.44)
-            let animating = ui.animKey == r.key && !r.done
+            let ix = bx + CGFloat(r.depth) * indentStep          // 本行左缘（按嵌套深度缩进）
+            let box = NSRect(x: ix, y: cy, width: checkD, height: checkD)
+            let textX = ix + checkD + checkGap
+            let rowRect = NSRect(x: ix - base * 0.35, y: ry - base * 0.22, width: rightX - ix + base * 0.7, height: rh + base * 0.44)
+
+            // ---- 分组标题：细线箭头 + 名称；折叠时右侧显示数量与最近的截止时间 ----
+            if r.type == .group {
+                let cs = checkD * 0.30, ccx = box.midX, gcy = ry + r.h / 2
+                let chev = NSBezierPath()
+                if r.folded {
+                    chev.move(to: NSPoint(x: ccx - cs * 0.45, y: gcy - cs)); chev.line(to: NSPoint(x: ccx + cs * 0.55, y: gcy)); chev.line(to: NSPoint(x: ccx - cs * 0.45, y: gcy + cs))
+                } else {
+                    chev.move(to: NSPoint(x: ccx - cs, y: gcy - cs * 0.45)); chev.line(to: NSPoint(x: ccx, y: gcy + cs * 0.55)); chev.line(to: NSPoint(x: ccx + cs, y: gcy - cs * 0.45))
+                }
+                chev.lineWidth = max(1.2, stroke * 0.95); chev.lineCapStyle = .round; chev.lineJoinStyle = .round
+                groupInk.faded(fd).setStroke(); chev.stroke()
+                drawText(r.text, groupFont, textX, ry, groupInk.faded(fd))
+                if !r.summary.isEmpty {
+                    let ss = textSize(r.summary, fMeta)
+                    let sc = (r.nearestDue > 0 && r.nearestDue <= nowE) ? coral : metaC
+                    drawText(r.summary, fMeta, rightX - ss.width, ry + (r.h - ss.height) / 2, sc.faded(fd * 0.9))
+                }
+                groupRects.append(HitRect(rect: rowRect, source: r.source, key: r.key, done: false))
+                rowRects.append(HitRect(rect: rowRect, source: r.source, key: r.key, done: false))
+                continue
+            }
+
+            let animating = r.type == .todo && ui.animKey == r.key && !r.done
             let alerting = ui.alertActive && !ui.alertTaskKey.isEmpty && !r.done && r.key == ui.alertTaskKey
 
             if alerting || animating {
-                (alerting ? coral.withAlphaComponent(CGFloat((26 + 34 * pulse) / 255))
-                          : accentDone.withAlphaComponent(CGFloat(34 * sin(.pi * animP) / 255))).setFill()
+                (alerting ? coral.withAlphaComponent(CGFloat((22 + 30 * pulse) / 255))
+                          : accentDone.withAlphaComponent(CGFloat(30 * sin(.pi * animP) / 255))).setFill()
                 NSBezierPath(roundedRect: rowRect, xRadius: base * 0.35, yRadius: base * 0.35).fill()
             }
 
-            if animating {
-                // 完成动画：涟漪 + 光点 + 复选框弹出填充 + 对勾描绘 + 删除线划过
+            let cr = checkD / 2 - stroke / 2
+            if r.type == .countdown {
+                // 独立倒计时：细线小钟代替复选框
+                (r.done ? doneCheck : toneColor(r.pillTone)).faded(fd).setStroke()
+                let ring = circle(box.midX, box.midY, cr); ring.lineWidth = stroke; ring.stroke()
+                let hands = NSBezierPath()
+                hands.move(to: NSPoint(x: box.midX, y: box.midY - cr * 0.55)); hands.line(to: NSPoint(x: box.midX, y: box.midY))
+                hands.line(to: NSPoint(x: box.midX + cr * 0.42, y: box.midY + cr * 0.20))
+                hands.lineWidth = stroke; hands.lineCapStyle = .round; hands.lineJoinStyle = .round; hands.stroke()
+                drawText(r.text, fText, textX, ry, (r.done ? doneInk : ink).faded(fd))
+            } else if animating {
+                // 完成动画：涟漪 + 光点 + 圆形复选框弹出填充 + 对勾描绘 + 删除线划过
                 let pf = easeOutBack(animP / 0.32)
                 let pt = clamp01((animP - 0.16) / 0.30)
                 let pr = clamp01(animP / 0.80)
                 let ps = easeInOutCubic((animP - 0.28) / 0.55)
                 let ccx = box.midX, ccy = box.midY
-                let rr = checkD * (0.55 + 1.30 * CGFloat(easeOutCubic(pr)))
-                let ring = NSBezierPath(ovalIn: NSRect(x: ccx - rr, y: ccy - rr, width: rr * 2, height: rr * 2))
-                accentDone.withAlphaComponent(CGFloat(0.67 * (1 - pr))).setStroke()
-                ring.lineWidth = max(1, stroke * CGFloat(1.5 - pr)); ring.stroke()
+                let rr = checkD * (0.55 + 1.25 * CGFloat(easeOutCubic(pr)))
+                let ripple = circle(ccx, ccy, rr)
+                accentDone.withAlphaComponent(CGFloat(0.63 * (1 - pr))).setStroke()
+                ripple.lineWidth = max(1, stroke * CGFloat(1.5 - pr)); ripple.stroke()
                 for k in 0..<8 {
                     let ang = Double(k) * .pi / 4 + 0.39
                     let dist = Double(checkD) * (0.6 + 1.5 * easeOutCubic(pr))
-                    let ds = checkD * 0.13 * CGFloat(1 - pr)
+                    let ds = checkD * 0.11 * CGFloat(1 - pr)
                     if ds < 0.3 { continue }
-                    (k % 2 == 0 ? accentDone : accentGold).withAlphaComponent(CGFloat(0.92 * (1 - pr))).setFill()
-                    let sx = ccx + CGFloat(cos(ang) * dist), sy = ccy + CGFloat(sin(ang) * dist)
-                    NSBezierPath(ovalIn: NSRect(x: sx - ds, y: sy - ds, width: ds * 2, height: ds * 2)).fill()
+                    (k % 2 == 0 ? accentDone : accentGold).withAlphaComponent(CGFloat(0.88 * (1 - pr))).setFill()
+                    circle(ccx + CGFloat(cos(ang) * dist), ccy + CGFloat(sin(ang) * dist), ds).fill()
                 }
                 lerpColor(checkc, accentDone, animP / 0.2).setStroke()
-                let bp = NSBezierPath(rect: box.insetBy(dx: stroke / 2, dy: stroke / 2)); bp.lineWidth = stroke; bp.stroke()
+                let bp = circle(ccx, ccy, cr); bp.lineWidth = stroke; bp.stroke()
                 let fs = checkD * CGFloat(pf)
-                if fs > 0.5 {
-                    accentDone.setFill()
-                    NSBezierPath(rect: NSRect(x: ccx - fs / 2, y: ccy - fs / 2, width: fs, height: fs)).fill()
-                }
-                drawTick(bx, cy, checkD, pt, .white, stroke + 0.35)
+                if fs > 0.5 { accentDone.setFill(); circle(ccx, ccy, fs / 2).fill() }
+                drawTick(ix, cy, checkD, pt, .white, stroke + 0.3)
                 let c = lerpColor(ink, doneInk, ps)
                 drawText(r.text, fText, textX, ry, c)
                 if ps > 0 {
                     let sl = NSBezierPath()
                     let sy = ry + r.h * 0.54
                     sl.move(to: NSPoint(x: textX, y: sy)); sl.line(to: NSPoint(x: textX + r.tw * CGFloat(ps), y: sy))
-                    sl.lineWidth = max(1.2, base * 0.06); c.setStroke(); sl.stroke()
+                    sl.lineWidth = max(1.2, base * 0.055); c.setStroke(); sl.stroke()
                 }
             } else {
-                if r.done { doneFill.setFill(); NSBezierPath(rect: box).fill() }
-                (r.done ? doneCheck : checkc).setStroke()
-                let bp = NSBezierPath(rect: box.insetBy(dx: stroke / 2, dy: stroke / 2)); bp.lineWidth = stroke; bp.stroke()
-                if r.done { drawTick(bx, cy, checkD, 1, doneCheck, stroke + 0.35) }
-                // 刚完成的一项：滑动期间强调色逐渐褪为已完成样式
+                if r.done { doneFill.faded(fd).setFill(); circle(box.midX, box.midY, checkD / 2).fill() }
+                (r.done ? doneCheck : checkc).faded(fd).setStroke()
+                let bp = circle(box.midX, box.midY, cr); bp.lineWidth = stroke; bp.stroke()
+                if r.done { drawTick(ix, cy, checkD, 1, doneCheck.faded(fd), stroke + 0.3) }
+                // 刚完成的一项：强调色逐渐褪为已完成样式
                 if r.done, ui.settling, r.key == ui.justCompletedKey {
                     let a = CGFloat(1 - settleT)
-                    accentDone.withAlphaComponent(a).setFill(); NSBezierPath(rect: box).fill()
-                    drawTick(bx, cy, checkD, 1, NSColor.white.withAlphaComponent(a), stroke + 0.35)
+                    accentDone.withAlphaComponent(a).setFill(); circle(box.midX, box.midY, checkD / 2).fill()
+                    drawTick(ix, cy, checkD, 1, NSColor.white.withAlphaComponent(a), stroke + 0.3)
                 }
-                drawText(r.text, fText, textX, ry, r.done ? doneInk : ink, strike: r.done)
+                drawText(r.text, fText, textX, ry, (r.done ? doneInk : ink).faded(fd), strike: r.done)
             }
 
             if r.source >= 0 {
-                let inflate = max(4, base * 0.2)
-                hitRects.append(HitRect(rect: box.insetBy(dx: -inflate, dy: -inflate), source: r.source, key: r.key, done: r.done))
                 rowRects.append(HitRect(rect: rowRect, source: r.source, key: r.key, done: r.done))
+                if r.type == .todo {
+                    let inflate = max(4, base * 0.2)
+                    hitRects.append(HitRect(rect: box.insetBy(dx: -inflate, dy: -inflate), source: r.source, key: r.key, done: r.done))
+                }
             }
 
-            // ---- 计时胶囊 ----
-            if pillColW > 0, let t = timer(for: r.key) {
+            // ---- 计时胶囊：细进度环 + 数字；只有到点 / 提醒时才有底色 ----
+            if r.pill, pillColW > 0 {
                 let px = rightX - pillColW, py = ry + rh / 2 - pillH / 2
-                let el = t.elapsed
-                let expired = t.countdown && el >= t.duration
-                var label = "", frac = 0.0, ringC = sky
-                if t.countdown {
-                    let rem = t.duration - el
-                    if rem > 0 {
-                        label = formatClock(rem)
-                        frac = t.duration > 0 ? Double(rem) / Double(t.duration) : 0
-                        ringC = (rem <= 60 || rem * 5 <= t.duration) ? amber : sky
-                    } else {
-                        label = "+" + formatClock(-rem)   // 超时多久
-                        frac = 1; ringC = coral
-                    }
-                } else {
-                    label = formatClock(el)
-                    frac = Double(el % 60) / 60
-                    ringC = violet
-                }
-                let fade: CGFloat = r.done ? 0.47 : (t.running ? 1 : 0.68)
+                let ringC = toneColor(r.pillTone)
+                let fade = CGFloat((r.done ? 0.45 : (r.pillRunning ? 1 : 0.65)) * fd)
                 let pill = NSRect(x: px, y: py, width: pillColW, height: pillH)
-                ((expired && !r.done) ? coral.withAlphaComponent(CGFloat(alerting ? (60 + 50 * pulse) / 255 : 0.2))
-                                      : tc.withAlphaComponent(r.done ? 0.055 : 0.1)).setFill()
-                NSBezierPath(roundedRect: pill, xRadius: pillH / 2, yRadius: pillH / 2).fill()
-
+                if r.pillExpired && !r.done {
+                    coral.withAlphaComponent(CGFloat((alerting ? (46 + 40 * pulse) : 36) / 255 * fd)).setFill()
+                    NSBezierPath(roundedRect: pill, xRadius: pillH / 2, yRadius: pillH / 2).fill()
+                }
                 let rcx = px + pillPadX + ringD / 2, rcy = py + pillH / 2
-                let rw = max(1.5, ringD * 0.16), rd = ringD - rw
-                let track = NSBezierPath(ovalIn: NSRect(x: rcx - rd / 2, y: rcy - rd / 2, width: rd, height: rd))
-                tc.withAlphaComponent(0.28 * fade).setStroke(); track.lineWidth = rw; track.stroke()
+                let rw = max(1.3, ringD * 0.13), rd = ringD - rw
+                let track = circle(rcx, rcy, rd / 2)
+                tc.withAlphaComponent(0.20 * fade).setStroke(); track.lineWidth = rw; track.stroke()
                 ringC.withAlphaComponent(fade).setStroke()
-                if frac >= 0.999 {
+                if r.pillFrac >= 0.999 {
                     track.stroke()
-                } else if frac > 0.001 {
+                } else if r.pillFrac > 0.001 {
                     let arc = NSBezierPath()
-                    arc.appendArc(withCenter: NSPoint(x: rcx, y: rcy), radius: rd / 2, startAngle: -90, endAngle: -90 + CGFloat(360 * frac), clockwise: false)
+                    arc.appendArc(withCenter: NSPoint(x: rcx, y: rcy), radius: rd / 2, startAngle: -90, endAngle: -90 + CGFloat(360 * r.pillFrac), clockwise: false)
                     arc.lineWidth = rw; arc.lineCapStyle = .round; arc.stroke()
                 }
-                if !t.running {   // 暂停：中间两道竖线
+                if !r.pillRunning {   // 暂停：中间两道竖线
                     ringC.withAlphaComponent(fade).setFill()
                     let bw2 = max(1.2, rw * 0.75), bh2 = ringD * 0.34
                     NSBezierPath(rect: NSRect(x: rcx - bw2 * 1.6, y: rcy - bh2 / 2, width: bw2, height: bh2)).fill()
                     NSBezierPath(rect: NSRect(x: rcx + bw2 * 0.6, y: rcy - bh2 / 2, width: bw2, height: bh2)).fill()
                 }
-                let lc = (expired && !r.done) ? rgb(255, 150, 140, fade) : tc.withAlphaComponent(fade)
-                let ls = NSAttributedString(string: label, attributes: attrs(timerFont, color: lc))
+                let lc = (r.pillExpired && !r.done) ? rgb(255, 160, 150, fade) : tc.withAlphaComponent(0.88 * fade)
+                let ls = NSAttributedString(string: r.pillLabel, attributes: attrs(timerFont, color: lc))
                 ls.draw(at: NSPoint(x: rcx + ringD / 2 + pillInnerGap, y: py + (pillH - ls.size().height) / 2))
-                pillRects.append(HitRect(rect: pill, source: r.source, key: r.key, done: r.done))
+                pillRects.append(HitRect(rect: pill, source: r.source, key: r.key, done: r.done, kind: r.pillDue ? 1 : 0))
             }
         }
         ui.lastRowY = rowY
@@ -874,12 +1289,12 @@ final class CardView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         if let b = bannerButtons.first(where: { $0.rect.contains(p) }) { controller?.bannerAction(b.action); return }
         if let h = pillRects.first(where: { $0.rect.contains(p) }) {
-            toggleTaskTimerPause(h.key); controller?.refresh(force: true); return
+            if h.kind == 1 { cfg.dueShowAbsolute.toggle(); controller?.saveConfig() }   // 截止时间：切换「剩余 / 截止时刻」
+            else { toggleTaskTimerPause(h.key) }                                         // 正计时：暂停 / 继续
+            controller?.refresh(force: true); return
         }
-        if let h = hitRects.first(where: { $0.rect.contains(p) }) {
-            controller?.beginToggle(h)
-            return
-        }
+        if let h = hitRects.first(where: { $0.rect.contains(p) }) { controller?.beginToggle(h); return }
+        if let h = groupRects.first(where: { $0.rect.contains(p) }) { controller?.toggleFold(h); return }
         if event.clickCount == 2 { controller?.editTodo(); return }
         window?.performDrag(with: event)
     }
@@ -903,35 +1318,37 @@ final class SettingsController: NSObject {
         self.app = app
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 340),
                         styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
-        panel.title = "DesktopTip 设置"
+        panel.title = "外观"
         panel.level = .floating
         panel.isReleasedWhenClosed = false
         super.init()
         let v = panel.contentView!
         func label(_ s: String, _ y: CGFloat) -> NSTextField {
-            let t = NSTextField(labelWithString: s); t.frame = NSRect(x: 20, y: y, width: 220, height: 18); v.addSubview(t); return t
+            let t = NSTextField(labelWithString: s); t.frame = NSRect(x: 20, y: y, width: 220, height: 18)
+            t.textColor = .secondaryLabelColor; v.addSubview(t); return t
         }
         func value(_ y: CGFloat) -> NSTextField {
             let t = NSTextField(labelWithString: ""); t.alignment = .right
+            t.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
             t.frame = NSRect(x: 260, y: y, width: 80, height: 18); v.addSubview(t); labels.append(t); return t
         }
         func slider(_ y: CGFloat, _ lo: Double, _ hi: Double, _ val: Double) -> NSSlider {
             let s = NSSlider(value: val, minValue: lo, maxValue: hi, target: self, action: #selector(changed))
             s.frame = NSRect(x: 20, y: y, width: 320, height: 22); v.addSubview(s); return s
         }
-        _ = label("字号  Font size", 306); _ = value(306)
+        _ = label("字号", 306); _ = value(306)
         fontSlider = slider(282, 10, 60, Double(cfg.fontHeight))
-        _ = label("行距  Spacing", 246); _ = value(246)
+        _ = label("行距", 246); _ = value(246)
         spaceSlider = slider(222, 0, 90, Double(cfg.lineHeight))
-        _ = label("卡片透明度  Opacity", 186); _ = value(186)
+        _ = label("卡片不透明度", 186); _ = value(186)
         opacitySlider = slider(162, 0, 255, Double(cfg.bgAlpha))
-        _ = label("文字颜色  Text", 122)
+        _ = label("文字颜色", 122)
         textWell = NSColorWell(frame: NSRect(x: 20, y: 90, width: 90, height: 28)); textWell.color = cfg.textColor
         textWell.target = self; textWell.action = #selector(changed); v.addSubview(textWell)
-        _ = label("卡片颜色  Card", 122).frame.origin.x = 200
+        _ = label("卡片颜色", 122).frame.origin.x = 200
         cardWell = NSColorWell(frame: NSRect(x: 200, y: 90, width: 90, height: 28)); cardWell.color = cfg.bgColor
         cardWell.target = self; cardWell.action = #selector(changed); v.addSubview(cardWell)
-        _ = label("字体  Font", 60)
+        _ = label("字体", 60)
         fontPopup = NSPopUpButton(frame: NSRect(x: 20, y: 24, width: 320, height: 28), pullsDown: false)
         fontPopup.addItems(withTitles: NSFontManager.shared.availableFontFamilies)
         fontPopup.selectItem(withTitle: cfg.fontFamily)
@@ -968,6 +1385,142 @@ final class SettingsController: NSObject {
     }
 }
 
+// MARK: - Countdown dialog
+// 两种设定方式可随时切换、互相换算：「截止时间」（年月日 时分秒）与「剩余时长」（月 天 时 分 秒）。
+// 确定后一律换算成截止时间（@YYYY-MM-DD HH:MM:SS）写进 TODO 文件。
+
+final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+final class DueDialog: NSObject, NSTextFieldDelegate {
+    let alert = NSAlert()
+    var nameField: NSTextField?
+    let seg = NSSegmentedControl(labels: ["截止时间", "剩余时长"], trackingMode: .selectOne, target: nil, action: nil)
+    let picker = NSDatePicker()
+    var rel: [NSTextField] = []
+    var relLabels: [NSTextField] = []
+    let preview = NSTextField(labelWithString: "")
+    let repeatBox = NSButton(checkboxWithTitle: "到点后按同样的间隔重复", target: nil, action: nil)
+    var fixedRepeat = 0
+    var mode = 1
+
+    init(heading: String, sub: String, askName: Bool, name: String, due: Int, repeatSec: Int, repeatChecked: Bool, mode: Int) {
+        super.init()
+        self.mode = mode
+        fixedRepeat = repeatSec
+        alert.messageText = heading
+        if !sub.isEmpty { alert.informativeText = sub }
+        alert.addButton(withTitle: "确定"); alert.addButton(withTitle: "取消")
+
+        let W: CGFloat = 340
+        let v = FlippedView(frame: NSRect(x: 0, y: 0, width: W, height: 10))
+        var y: CGFloat = 4
+        if askName {
+            let l = NSTextField(labelWithString: "名称（可留空）"); l.textColor = .secondaryLabelColor
+            l.frame = NSRect(x: 0, y: y, width: W, height: 18); v.addSubview(l)
+            let f = NSTextField(frame: NSRect(x: 0, y: y + 20, width: W, height: 24)); f.stringValue = name
+            v.addSubview(f); nameField = f
+            y += 56
+        }
+        seg.frame = NSRect(x: 0, y: y, width: 200, height: 24)
+        seg.target = self; seg.action = #selector(modeChanged)
+        v.addSubview(seg)
+        y += 36
+        picker.datePickerStyle = .textFieldAndStepper
+        picker.datePickerElements = [.yearMonthDay, .hourMinuteSecond]
+        picker.dateValue = Date(timeIntervalSince1970: TimeInterval(due))
+        picker.frame = NSRect(x: 0, y: y, width: 240, height: 24)
+        picker.target = self; picker.action = #selector(changed)
+        v.addSubview(picker)
+        let units = ["月", "天", "时", "分", "秒"]
+        for i in 0..<5 {
+            let x = CGFloat(i) * 68
+            let f = NSTextField(frame: NSRect(x: x, y: y, width: 44, height: 24))
+            f.alignment = .right; f.delegate = self
+            f.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+            v.addSubview(f); rel.append(f)
+            let l = NSTextField(labelWithString: units[i]); l.frame = NSRect(x: x + 47, y: y + 3, width: 20, height: 18)
+            v.addSubview(l); relLabels.append(l)
+        }
+        y += 36
+        preview.frame = NSRect(x: 0, y: y, width: W, height: 18)
+        preview.textColor = .secondaryLabelColor
+        preview.font = NSFont.systemFont(ofSize: 12)
+        preview.lineBreakMode = .byTruncatingTail
+        v.addSubview(preview)
+        y += 28
+        repeatBox.frame = NSRect(x: 0, y: y, width: W, height: 20)
+        repeatBox.state = repeatChecked ? .on : .off
+        repeatBox.target = self; repeatBox.action = #selector(changed)
+        v.addSubview(repeatBox)
+        y += 26
+        v.setFrameSize(NSSize(width: W, height: y))
+        alert.accessoryView = v
+
+        setRel(due)
+        showMode()
+        updatePreview()
+        alert.window.initialFirstResponder = nameField ?? (mode == 0 ? picker : rel[3])
+    }
+
+    func relDue() -> Int {
+        let now = nowEpoch()
+        let v = rel.map { Int($0.stringValue.filter { $0.isASCII && $0.isNumber }.prefix(9)) ?? 0 }
+        return addMonths(now, min(v[0], 1200)) + v[1] * 86400 + v[2] * 3600 + v[3] * 60 + v[4]
+    }
+    func setRel(_ due: Int) {
+        for (i, n) in splitRemain(nowEpoch(), due).enumerated() { rel[i].stringValue = "\(n)" }
+    }
+    func current() -> Int { mode == 0 ? Int(picker.dateValue.timeIntervalSince1970) : relDue() }
+
+    func showMode() {
+        seg.selectedSegment = mode
+        picker.isHidden = mode != 0
+        for f in rel { f.isHidden = mode != 1 }
+        for l in relLabels { l.isHidden = mode != 1 }
+    }
+
+    func updatePreview() {
+        let now = nowEpoch(), due = current()
+        var t: String
+        if due <= now { t = "这个时间已经过去了，请设一个将来的时刻" }
+        else if mode == 0 { t = "还剩 " + formatRemain(due - now) }
+        else { t = "将于 " + formatDueText(due) + " 到点" }
+        if due > now, repeatBox.state == .on {
+            t += "，之后每隔 " + formatRemain(fixedRepeat > 0 ? fixedRepeat : due - now) + " 重复"
+        }
+        preview.stringValue = t
+    }
+
+    @objc func modeChanged() {
+        let nm = seg.selectedSegment
+        guard nm != mode else { return }
+        var due = current()
+        if due <= nowEpoch() { due = nowEpoch() + 60 }
+        mode = nm
+        if nm == 0 { picker.dateValue = Date(timeIntervalSince1970: TimeInterval(due)) } else { setRel(due) }
+        showMode(); updatePreview()
+    }
+    @objc func changed() { updatePreview() }
+    func controlTextDidChange(_ obj: Notification) { updatePreview() }
+
+    func run() -> (name: String, due: Int, repeatSec: Int)? {
+        NSApp.activate(ignoringOtherApps: true)
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in if self?.mode == 0 { self?.updatePreview() } }
+        RunLoop.main.add(t, forMode: .modalPanel)
+        defer { t.invalidate() }
+        while true {
+            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+            let now = nowEpoch(), due = current()
+            if due <= now {
+                let a = NSAlert(); a.messageText = "请设一个将来的时刻。"; a.runModal()
+                continue
+            }
+            let rep = repeatBox.state == .on ? (fixedRepeat > 0 ? fixedRepeat : due - now) : 0
+            return (trimmed(nameField?.stringValue ?? ""), due, rep)
+        }
+    }
+}
+
 // MARK: - App controller
 
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
@@ -982,6 +1535,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     var animFrame = 0
     var shakeBaseTL = NSPoint.zero      // 抖动基准位置（窗口左上角）
     var menuTaskKey = ""
+    var menuHint = -1
 
     // 置顶时鼠标悬停隐藏：鼠标移到卡片上时淡出并忽略鼠标事件（点击穿透到下面的窗口），
     // 移开后淡入恢复；按住 ⌘ 时保持显示、可正常拖动/勾选/右键。
@@ -989,16 +1543,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     var hoverHidden = false
     var menuTracking = false
 
-    // reminder state
-    var armed = false
-    var due = Date()
-    var remTitle = "", remDetail = ""
-    var isCountdown = false
-    var interval = 0
-
     func applicationDidFinishLaunching(_ n: Notification) {
         ensureDefaultTodo()
         if !FileManager.default.fileExists(atPath: cfg.todoPath) { cfg.todoPath = supportDir.appendingPathComponent("TODO.txt").path; ensureDefaultTodo() }
+        migrateLegacyCountdowns()
 
         card = CardView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
         card.controller = self
@@ -1025,9 +1573,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         window.orderFrontRegardless()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let img = NSImage(systemSymbolName: "checklist", accessibilityDescription: "DesktopTip") {
-            statusItem.button?.image = img
-        } else { statusItem.button?.title = "✓" }
+        statusItem.button?.image = AppController.menuBarIcon()
         let m = NSMenu(); m.delegate = self; statusItem.menu = m
 
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -1035,6 +1581,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in self?.menuTracking = true }
         NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in self?.menuTracking = false }
+    }
+
+    /// 菜单栏图标：细线圆环 + 对勾 + 一小段进度弧（模板图，随系统明暗自动着色）
+    static func menuBarIcon() -> NSImage {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let c = NSPoint(x: 9, y: 9)
+            let ring = NSBezierPath()
+            ring.appendArc(withCenter: c, radius: 6.6, startAngle: 120, endAngle: 420, clockwise: false)
+            ring.lineWidth = 1.5; ring.lineCapStyle = .round
+            NSColor.black.withAlphaComponent(0.45).setStroke(); ring.stroke()
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: c, radius: 6.6, startAngle: 90, endAngle: 120, clockwise: false)
+            arc.lineWidth = 1.5; arc.lineCapStyle = .round
+            NSColor.black.setStroke(); arc.stroke()
+            let tick = NSBezierPath()
+            tick.move(to: NSPoint(x: 6.0, y: 9.2)); tick.line(to: NSPoint(x: 8.2, y: 7.0)); tick.line(to: NSPoint(x: 12.2, y: 11.2))
+            tick.lineWidth = 1.6; tick.lineCapStyle = .round; tick.lineJoinStyle = .round
+            tick.stroke()
+            return true
+        }
+        img.isTemplate = true
+        return img
     }
 
     @objc func screensChanged() { clampToScreens() }
@@ -1088,8 +1656,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     // Layout/refresh keeping the top-left corner fixed
     func refresh(force: Bool = false) {
         let sig = (try? FileManager.default.attributesOfItem(atPath: cfg.todoPath)[.modificationDate] as? Date) ?? nil
-        let minute = Calendar.current.component(.minute, from: Date()) * 60 + Calendar.current.component(.second, from: Date())
-        _ = minute
         if !force && sig == lastMTime && !contentHasPlaceholders { return }
         lastMTime = sig
         let size = card.relayout()
@@ -1116,9 +1682,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     func tick() {
-        checkReminder()
-        checkTaskTimers()
-        refresh(force: taskTimers.contains { $0.running })   // 有计时在走：每秒刷新
+        checkDeadlines()
+        refresh(force: taskTimers.contains { $0.running && !$0.countdown } || card.hasDuePill)   // 有计时在走：每秒刷新
         if cfg.displayMode == 1 || ui.alertActive { window.orderFrontRegardless() }
     }
 
@@ -1148,78 +1713,84 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         menu.addItem(it); return it
     }
 
+    func submenu(_ m: NSMenu, _ title: String, _ sub: NSMenu) {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: ""); it.submenu = sub; m.addItem(it)
+    }
+
     func buildMenu(taskAt point: NSPoint? = nil) -> NSMenu {
         let m = NSMenu()
-        // 在某条待办上右键：顶部出现「任务计时」子菜单
-        menuTaskKey = ""
+        // 在某个条目上右键：顶部出现针对该条目的操作
+        menuTaskKey = ""; menuHint = -1
         if let point, let row = card.rowRects.first(where: { $0.rect.contains(point) }) {
-            menuTaskKey = row.key
-            let task = NSMenu()
-            let cd = NSMenu()
-            for mins in [5, 10, 15, 25, 30, 45, 60, 90] {
-                let title = mins == 25 ? "25 分钟（番茄钟）" : mins % 60 == 0 ? "\(mins / 60) 小时" : "\(mins) 分钟"
-                add(cd, title, #selector(taskCountdown(_:)), mins * 60)
+            menuTaskKey = row.key; menuHint = row.source
+            var L = LineInfo()
+            if let lines = readTodoLines(), let idx = findItemLine(lines, row.source, row.key) { L = parseLine(lines[idx]); menuHint = idx }
+            var name = processPlaceholders(keyDisplayName(row.key))
+            if name.count > 18 { name = String(name.prefix(18)) + "…" }
+            if name.isEmpty { name = isGroupKey(row.key) ? "未命名分组" : "倒计时" }
+            add(m, name, nil, enabled: false)
+            if isGroupKey(row.key) {
+                add(m, L.fold ? "展开分组" : "折叠分组", #selector(itemFold))
+                add(m, L.hide ? "取消隐藏分组" : "隐藏分组", #selector(itemHide))
+            } else {
+                let isCd = isCountdownKey(row.key)
+                let quick = NSMenu()
+                for mins in [5, 10, 15, 25, 30, 45, 60, 90] {
+                    add(quick, mins % 60 == 0 ? "\(mins / 60) 小时后" : "\(mins) 分钟后", #selector(itemQuick(_:)), mins * 60)
+                }
+                if isCd {
+                    add(m, "修改倒计时…", #selector(itemSetDue))
+                    submenu(m, "快速设定", quick)
+                    add(m, "删除倒计时", #selector(itemDelete))
+                } else {
+                    add(m, L.hasDue ? "修改截止时间…" : "设置截止时间…", #selector(itemSetDue))
+                    submenu(m, "快速倒计时", quick)
+                    if L.hasDue { add(m, "清除截止时间", #selector(itemClearDue)) }
+                    m.addItem(.separator())
+                    if let t = timer(for: row.key) {
+                        add(m, t.running ? "暂停正计时" : "继续正计时", #selector(taskPause))
+                        add(m, "重新开始正计时", #selector(taskRestart))
+                        add(m, "移除正计时", #selector(taskRemove))
+                    } else {
+                        add(m, "开始正计时", #selector(taskStopwatch))
+                    }
+                }
+                m.addItem(.separator())
+                add(m, "分组折叠 / 隐藏时仍显示", #selector(itemShow), checked: L.show)
+                add(m, L.hide ? "取消隐藏" : "隐藏", #selector(itemHide))
             }
-            cd.addItem(.separator())
-            add(cd, "自定义…  Custom", #selector(taskCustomCountdown))
-            let cdItem = NSMenuItem(title: "倒计时  Countdown", action: nil, keyEquivalent: ""); cdItem.submenu = cd; task.addItem(cdItem)
-            add(task, "正计时  Stopwatch", #selector(taskStopwatch))
-            if let t = timer(for: row.key) {
-                task.addItem(.separator())
-                add(task, t.running ? "暂停  Pause" : "继续  Resume", #selector(taskPause))
-                add(task, "重新开始  Restart", #selector(taskRestart))
-                add(task, "移除计时  Remove timer", #selector(taskRemove))
-            }
-            var name = processPlaceholders(row.key)
-            if name.count > 16 { name = String(name.prefix(16)) + "…" }
-            let ti = NSMenuItem(title: "任务计时：\(name)  Timer", action: nil, keyEquivalent: ""); ti.submenu = task; m.addItem(ti)
             m.addItem(.separator())
         }
-        add(m, "设置…  Settings", #selector(showSettings))
-        m.addItem(.separator())
-        let cd = NSMenu()
-        add(cd, "1 分钟", #selector(countdown(_:)), 60)
-        add(cd, "5 分钟", #selector(countdown(_:)), 300)
-        add(cd, "10 分钟", #selector(countdown(_:)), 600)
-        add(cd, "1 小时", #selector(countdown(_:)), 3600)
-        cd.addItem(.separator())
-        add(cd, "重复计时  Repeat", #selector(toggleRepeat), checked: cfg.countdownRepeat)
-        cd.addItem(.separator())
-        add(cd, "自定义…  Custom", #selector(customCountdown))
-        let cdItem = NSMenuItem(title: "倒计时  Countdown", action: nil, keyEquivalent: ""); cdItem.submenu = cd; m.addItem(cdItem)
-        add(m, "设置闹钟…  Alarm", #selector(customAlarm))
-        if armed {
-            let left = max(0, Int(due.timeIntervalSinceNow))
-            var s = "已设置：\(remTitle)（剩余 \(formatDuration(left))）"
-            if isCountdown && cfg.countdownRepeat && interval > 0 { s += " · 重复" }
-            add(m, s, nil, enabled: false)
-            if !ui.alertActive { add(m, "取消倒计时/闹钟  Cancel", #selector(cancelReminder)) }
-        }
-        if ui.alertActive { add(m, "停止提醒  Stop alert", #selector(cancelReminder)) }
+        add(m, "新建倒计时…", #selector(newCountdown))
+        if ui.alertActive { add(m, "停止提醒", #selector(stopAlertAction)) }
+        add(m, "显示隐藏的条目", #selector(toggleShowHidden), checked: cfg.showHidden)
+        add(m, "已完成项沉底", #selector(toggleSink), checked: cfg.sinkCompleted)
         m.addItem(.separator())
         let mode = NSMenu()
-        add(mode, "附着桌面  Attach to desktop", #selector(setMode(_:)), 0, checked: cfg.displayMode == 0)
-        add(mode, "始终置顶  Always on top", #selector(setMode(_:)), 1, checked: cfg.displayMode == 1)
+        add(mode, "附着桌面", #selector(setMode(_:)), 0, checked: cfg.displayMode == 0)
+        add(mode, "始终置顶", #selector(setMode(_:)), 1, checked: cfg.displayMode == 1)
         mode.addItem(.separator())
-        add(mode, "置顶时鼠标悬停隐藏（按住 ⌘ 可操作）  Hide on hover when on top", #selector(toggleHoverHide), checked: cfg.hoverHide)
-        let mi = NSMenuItem(title: "显示模式  Display mode", action: nil, keyEquivalent: ""); mi.submenu = mode; m.addItem(mi)
+        add(mode, "置顶时悬停隐藏（按住 ⌘ 可操作）", #selector(toggleHoverHide), checked: cfg.hoverHide)
+        submenu(m, "显示模式", mode)
+        add(m, "外观设置…", #selector(showSettings))
         m.addItem(.separator())
-        add(m, "编辑 TODO  Edit", #selector(editTodoAction))
-        add(m, "刷新  Refresh", #selector(refreshAction))
-        add(m, "更换 TODO 文件  Change file", #selector(changeFile))
-        add(m, "在访达中显示  Reveal in Finder", #selector(reveal))
+        add(m, "编辑 TODO", #selector(editTodoAction))
+        add(m, "刷新", #selector(refreshAction))
+        add(m, "更换 TODO 文件…", #selector(changeFile))
+        add(m, "在访达中显示", #selector(reveal))
         m.addItem(.separator())
-        add(m, "退出  Quit", #selector(quit))
+        add(m, "退出", #selector(quit))
         return m
     }
 
     @objc func showSettings() {
         if settings == nil { settings = SettingsController(app: self) }
-        let p = NSEvent.mouseLocation
-        settings?.show(near: p)
+        settings?.show(near: NSEvent.mouseLocation)
     }
     @objc func setMode(_ s: NSMenuItem) { cfg.displayMode = s.tag; applyMode(); saveConfig(); window.orderFrontRegardless() }
     @objc func toggleHoverHide() { cfg.hoverHide.toggle(); updateHoverHide(); saveConfig() }
+    @objc func toggleShowHidden() { animateLayout { cfg.showHidden.toggle() }; saveConfig() }
+    @objc func toggleSink() { cfg.sinkCompleted.toggle(); saveConfig(); refresh(force: true) }
     @objc func refreshAction() { refresh(force: true) }
     @objc func editTodoAction() { editTodo() }
     func editTodo() { NSWorkspace.shared.open(URL(fileURLWithPath: cfg.todoPath)) }
@@ -1238,146 +1809,169 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
-    // MARK: Reminders
-
-    func formatDuration(_ s: Int) -> String {
-        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
-        return String(format: "%d:%02d", m, sec)
+    /// 行位置会变化的操作（折叠 / 隐藏）：先记下各行位置，改完后平滑滑到新位置
+    func animateLayout(_ change: () -> Void) {
+        snapshotRowsForSettle()
+        change()
+        refresh(force: true)
+        ensureAnimTimer()
     }
 
-    func info(_ title: String, _ msg: String? = nil) {
-        let a = NSAlert(); a.messageText = title; if let msg { a.informativeText = msg }
-        NSApp.activate(ignoringOtherApps: true); a.runModal()
+    func toggleFold(_ h: HitRect) { animateLayout { editItemLine(h.source, h.key) { L in if L.kind == .group { L.fold.toggle() }; return true } } }
+
+    // MARK: Item actions（任务 / 独立倒计时 / 分组）
+
+    func stopAlertIfFor(_ key: String) { if ui.alertActive && ui.alertTaskKey == key { stopAlert() } }
+
+    @objc func itemQuick(_ s: NSMenuItem) {
+        setItemDue(menuHint, menuTaskKey, nowEpoch() + s.tag)
+        stopAlertIfFor(menuTaskKey); refresh(force: true)
     }
-
-    func prompt(_ title: String, _ label: String, _ initial: String) -> String? {
-        let a = NSAlert(); a.messageText = title; a.informativeText = label
-        a.addButton(withTitle: "确定"); a.addButton(withTitle: "取消")
-        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24)); f.stringValue = initial
-        a.accessoryView = f; a.window.initialFirstResponder = f
-        NSApp.activate(ignoringOtherApps: true)
-        return a.runModal() == .alertFirstButtonReturn ? f.stringValue.trimmingCharacters(in: .whitespaces) : nil
-    }
-
-    func armCountdown(_ seconds: Int) {
-        armed = true; due = Date().addingTimeInterval(TimeInterval(seconds))
-        remTitle = "倒计时结束"; remDetail = "倒计时 \(formatDuration(seconds)) 已到"
-        isCountdown = true; interval = seconds
-        info("倒计时已开始：\(formatDuration(seconds))" + (cfg.countdownRepeat ? "（重复计时已开启）" : ""))
-    }
-
-    @objc func countdown(_ s: NSMenuItem) { armCountdown(s.tag) }
-    @objc func toggleRepeat() { cfg.countdownRepeat.toggle(); saveConfig() }
-
-    @objc func customCountdown() {
-        guard let v = prompt("设置倒计时", "输入分钟数，或 MM:SS / HH:MM:SS", "10") else { return }
-        if let secs = parseDurationInput(v) { armCountdown(secs) } else { info("请输入有效的倒计时时长。") }
-    }
-
-    @objc func customAlarm() {
-        let df = DateFormatter(); df.dateFormat = "HH:mm"
-        guard let v = prompt("设置闹钟", "输入闹钟时间 HH:MM 或 HH:MM:SS", df.string(from: Date().addingTimeInterval(300))) else { return }
-        let p = v.split(separator: ":").map { Int($0) }
-        guard (2...3).contains(p.count), p.allSatisfy({ $0 != nil }) else { info("请输入有效的闹钟时间。"); return }
-        let (h, m, s) = (p[0]!, p[1]!, p.count == 3 ? p[2]! : 0)
-        guard (0..<24).contains(h), (0..<60).contains(m), (0..<60).contains(s),
-              var d = Calendar.current.date(bySettingHour: h, minute: m, second: s, of: Date()) else { info("请输入有效的闹钟时间。"); return }
-        if d <= Date() { d = Calendar.current.date(byAdding: .day, value: 1, to: d)! }
-        armed = true; due = d; isCountdown = false; interval = 0
-        remTitle = "闹钟时间到"
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        remDetail = "设定时间：" + f.string(from: d)
-        info("闹钟已设置：" + f.string(from: d))
-    }
-
-    @objc func cancelReminder() {
-        if ui.alertActive { stopAlert() } else { armed = false; isCountdown = false; interval = 0 }
-    }
-
-    func checkReminder() {
-        guard armed, Date() >= due else { return }
-        let repeating = isCountdown && cfg.countdownRepeat && interval > 0
-        func scheduleNext() {
-            var next = due.addingTimeInterval(TimeInterval(interval))
-            while next <= Date() { next = next.addingTimeInterval(TimeInterval(interval)) }
-            due = next; remTitle = "倒计时结束"; remDetail = "重复倒计时 \(formatDuration(interval)) 已到"
+    @objc func itemClearDue() {
+        editItemLine(menuHint, menuTaskKey) { L in
+            if L.kind == .countdown { return false }   // 独立倒计时没有截止时间就没有意义：直接删除
+            L.hasDue = false; L.repeatSec = 0; return true
         }
-        if ui.alertActive { if repeating { scheduleNext() }; return }
-        let t = remTitle, d = remDetail
-        armed = false
-        startAlert(t, d, key: "")
-        if repeating { armed = true; scheduleNext() } else { isCountdown = false; interval = 0 }
+        stopAlertIfFor(menuTaskKey); refresh(force: true)
     }
+    @objc func itemDelete() {
+        editItemLine(menuHint, menuTaskKey) { _ in false }
+        stopAlertIfFor(menuTaskKey); refresh(force: true)
+    }
+    @objc func itemHide() { let k = menuTaskKey, h = menuHint; animateLayout { editItemLine(h, k) { L in L.hide.toggle(); return true } } }
+    @objc func itemShow() {
+        let k = menuTaskKey, h = menuHint
+        animateLayout { editItemLine(h, k) { L in if L.kind == .todo || L.kind == .countdown { L.show.toggle() }; return true } }
+    }
+    @objc func itemFold() { let k = menuTaskKey, h = menuHint; animateLayout { editItemLine(h, k) { L in if L.kind == .group { L.fold.toggle() }; return true } } }
 
-    // MARK: Per-task timer menu actions
-
-    @objc func taskCountdown(_ s: NSMenuItem) { startTaskCountdown(menuTaskKey, s.tag); refresh(force: true) }
-    @objc func taskCustomCountdown() {
+    @objc func itemSetDue() {
         let key = menuTaskKey
-        guard !key.isEmpty, let v = prompt("任务倒计时", "输入分钟数，或 MM:SS / HH:MM:SS", "25") else { return }
-        if let secs = parseDurationInput(v) { startTaskCountdown(key, secs); refresh(force: true) } else { info("请输入有效的倒计时时长。") }
+        guard let lines = readTodoLines(), let idx = findItemLine(lines, menuHint, key) else { return }
+        let L = parseLine(lines[idx])
+        let now = nowEpoch(), isCd = L.kind == .countdown
+        let dlg = DueDialog(heading: isCd ? "修改倒计时" : (L.hasDue ? "修改截止时间" : "设置截止时间"),
+                            sub: isCd ? "" : processPlaceholders(trimmed(L.text)),
+                            askName: isCd, name: L.text,
+                            due: (L.hasDue && L.due > now) ? L.due : now + 25 * 60,
+                            repeatSec: L.repeatSec, repeatChecked: L.repeatSec > 0, mode: cfg.dueInputMode)
+        guard let r = dlg.run() else { return }
+        cfg.dueInputMode = dlg.mode
+        var newKey = key
+        let ok = editItemLine(idx, key) { E in
+            guard E.kind == .todo || E.kind == .countdown else { return true }
+            if E.kind == .countdown { E.text = r.name }
+            E.hasDue = true; E.due = r.due; E.repeatSec = r.repeatSec
+            newKey = itemKey(E)
+            return true
+        }
+        if ok { noteDueSet(newKey, r.due) }
+        stopAlertIfFor(key)
+        saveConfig(); refresh(force: true)
     }
+
+    /// 新建独立倒计时（不挂在任务上），同样写进 TODO 文件
+    @objc func newCountdown() {
+        let dlg = DueDialog(heading: "新建倒计时", sub: "会以「! 名称 @截止时间」的形式写进 TODO 文件",
+                            askName: true, name: "", due: nowEpoch() + 10 * 60,
+                            repeatSec: 0, repeatChecked: cfg.countdownRepeat, mode: cfg.dueInputMode)
+        guard let r = dlg.run() else { return }
+        cfg.dueInputMode = dlg.mode
+        cfg.countdownRepeat = r.repeatSec > 0
+        if insertCountdownLine(r.name, r.due, r.repeatSec) { noteDueSet(keyCDPrefix + r.name, r.due) }
+        else { let a = NSAlert(); a.messageText = "无法写入 TODO 文件。"; a.runModal() }
+        saveConfig(); refresh(force: true)
+    }
+
+    @objc func stopAlertAction() { dismissDueItem(ui.alertTaskKey); stopAlert() }
+
+    // MARK: Stopwatch menu actions
+
     @objc func taskStopwatch() { startTaskStopwatch(menuTaskKey); refresh(force: true) }
     @objc func taskPause() { toggleTaskTimerPause(menuTaskKey); refresh(force: true) }
     @objc func taskRestart() { restartTaskTimer(menuTaskKey); refresh(force: true) }
-    @objc func taskRemove() {
-        let key = menuTaskKey
-        removeTaskTimer(key)
-        if ui.alertActive && ui.alertTaskKey == key { stopAlert() }
-        refresh(force: true)
-    }
+    @objc func taskRemove() { removeTaskTimer(menuTaskKey); refresh(force: true) }
 
-    /// 每秒检查任务倒计时是否到点
-    func checkTaskTimers() {
-        let lines = readTodoLines()
-        var open: [String: Bool] = [:]
-        for l in lines ?? [] {
-            guard let k = todoKey(l) else { continue }
-            if !k.done { open[k.key] = true } else if open[k.key] == nil { open[k.key] = false }
+    // MARK: Deadlines
+
+    /// 每秒检查截止时间是否已到（任务与独立倒计时共用）
+    func checkDeadlines() {
+        guard var lines = readTodoLines() else { return }
+        let now = nowEpoch()
+        for i in dueMeta.indices { dueMeta[i].seen = false }
+        var metaChanged = false, fileChanged = false
+        var fires: [(key: String, title: String, detail: String)] = []
+        func meta(_ key: String, _ due: Int) -> Int {
+            if let i = dueMetaIndex(key, due) { dueMeta[i].seen = true; return i }
+            dueMeta.append(DueMeta(due: due, setAt: now, fired: false, key: key, seen: true))
+            metaChanged = true
+            return dueMeta.count - 1
         }
-        var changed = false
-        var due: [TaskTimer] = []
-        for i in taskTimers.indices {
-            let t = taskTimers[i]
-            guard t.countdown, !t.fired, t.running, t.elapsed >= t.duration else { continue }
-            taskTimers[i].fired = true; changed = true
-            if lines != nil && open[t.key] != true { continue }   // 任务已完成或已删除：静默
-            due.append(t)
+        for i in lines.indices {
+            var L = parseLine(lines[i])
+            guard (L.kind == .todo || L.kind == .countdown), L.hasDue else { continue }
+            let key = itemKey(L)
+            let mi = meta(key, L.due)
+            if L.ok || dueMeta[mi].fired || now < L.due { continue }
+            dueMeta[mi].fired = true; metaChanged = true
+            let name = processPlaceholders(trimmed(L.text))
+            var f: (key: String, title: String, detail: String)
+            if L.kind == .countdown { f = (key, name.isEmpty ? "倒计时结束" : name, "倒计时结束 · " + formatDueText(L.due)) }
+            else { f = (key, "截止时间到", name) }
+            if L.repeatSec > 0 {   // 重复：截止时间顺延到下一个未来时刻
+                var nd = L.due
+                while nd <= now { nd += L.repeatSec }
+                L.due = nd
+                lines[i] = formatLine(L); fileChanged = true
+                let mj = meta(key, nd)
+                dueMeta[mj].setAt = nd - L.repeatSec; dueMeta[mj].fired = false
+                f.detail += " · 下次 " + formatDueShort(nd)
+            }
+            fires.append(f)
         }
-        if changed { saveTaskTimers() }
-        for t in due { startAlert("时间到 · " + formatShortDuration(t.duration), processPlaceholders(t.key), key: t.key) }
+        let before = dueMeta.count
+        dueMeta.removeAll { !$0.seen }
+        if dueMeta.count != before { metaChanged = true }
+        if fileChanged { _ = writeTodoLines(lines) }
+        if metaChanged { saveDueMeta() }
+        for f in fires { startAlert(f.title, f.detail, key: f.key) }
     }
 
     func bannerButtonSpec() -> [(action: BannerAction, title: String)] {
         var v: [(action: BannerAction, title: String)] = []
-        let task = !ui.alertTaskKey.isEmpty
-        if task { v.append((.done, "完成")) }
-        if task || !armed { v.append((.snooze, "+5 分钟")) }
+        if !ui.alertTaskKey.isEmpty && !isCountdownKey(ui.alertTaskKey) { v.append((.done, "完成")) }
+        v.append((.snooze, "+5 分钟"))
         v.append((.dismiss, "知道了"))
         return v
+    }
+
+    /// 「知道了」：不重复的独立倒计时到点后从文件里移除；任务保留截止时间（显示为已超时）
+    func dismissDueItem(_ key: String) {
+        guard isCountdownKey(key), var lines = readTodoLines(), let idx = findItemLine(lines, -1, key) else { return }
+        let L = parseLine(lines[idx])
+        if L.kind == .countdown && L.repeatSec == 0 && L.due <= nowEpoch() {
+            lines.remove(at: idx); _ = writeTodoLines(lines)
+        }
     }
 
     func bannerAction(_ action: BannerAction) {
         let key = ui.alertTaskKey
         switch action {
-        case .done where !key.isEmpty:
+        case .done where !key.isEmpty && !isCountdownKey(key):
             stopAlert()
             if let h = card.hitRects.first(where: { $0.key == key && !$0.done }) { beginToggle(h) }   // 播放完成动画
             else if toggleTodo(key: key, hint: -1) { refresh(force: true) }
             return
         case .snooze:
-            if !key.isEmpty { snoozeTaskTimer(key, 5 * 60) }
-            else if !armed {
-                armed = true; due = Date().addingTimeInterval(300); isCountdown = false; interval = 0
-                remTitle = "倒计时结束"; remDetail = "稍后提醒（5 分钟）已到"
-            }
+            if !key.isEmpty { setItemDue(-1, key, nowEpoch() + 300) }   // 截止时间改为 5 分钟后
+        case .dismiss:
+            dismissDueItem(key)
         default: break
         }
         stopAlert()
     }
 
-    // MARK: Alert（到点：卡片升到最前端 + 抖动 + 提醒横幅；替代原来的全屏弹跳提示）
+    // MARK: Alert（到点：卡片升到最前端 + 抖动 + 提醒横幅）
 
     func startAlert(_ title: String, _ detail: String, key: String) {
         ui.alertTitle = title; ui.alertDetail = detail; ui.alertTaskKey = key
