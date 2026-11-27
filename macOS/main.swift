@@ -23,7 +23,9 @@ struct Config {
     var bg = (r: 20, g: 25, b: 35)
     var bgAlpha = 128
     var fontFamily = "PingFang SC"
-    var displayMode = 0          // 0 = 附着桌面, 1 = 始终置顶
+    var displayMode = 2          // 0 = 附着桌面, 1 = 始终置顶, 2 = 智能浮现（新安装默认）
+    var surfaceLead = 10         // 智能浮现：截止前多少分钟浮现
+    var surfaceEvery = 45        // 智能浮现：每隔多少分钟轻浮现一次（0 = 关闭）
     var countdownRepeat = false  // 新建独立倒计时时「重复」的默认值
     var hoverHide = true         // 始终置顶时鼠标悬停隐藏（按住 ⌘ 可操作）
     var showHidden = false       // 临时显示带 _HIDE 的条目（淡显）
@@ -58,6 +60,8 @@ struct Config {
             case "BgColor_B": c.bg.b = n
             case "FontFamily": if !val.isEmpty, val != "Microsoft YaHei UI" { c.fontFamily = val }
             case "DisplayMode": c.displayMode = n
+            case "SurfaceLead": c.surfaceLead = max(1, n)
+            case "SurfaceEvery": c.surfaceEvery = max(0, n)
             case "CountdownRepeat": c.countdownRepeat = n != 0
             case "HoverHide": c.hoverHide = n != 0
             case "ShowHidden": c.showHidden = n != 0
@@ -81,6 +85,7 @@ struct Config {
         out += "FontFamily: \(fontFamily)\nDisplayMode: \(displayMode)\nCountdownRepeat: \(countdownRepeat ? 1 : 0)\n"
         out += "HoverHide: \(hoverHide ? 1 : 0)\nShowHidden: \(showHidden ? 1 : 0)\nSinkCompleted: \(sinkCompleted ? 1 : 0)\n"
         out += "DueDisplay: \(dueShowAbsolute ? 1 : 0)\nDueInputMode: \(dueInputMode)\n"
+        out += "SurfaceLead: \(surfaceLead)\nSurfaceEvery: \(surfaceEvery)\n"
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
@@ -913,7 +918,8 @@ final class CardView: NSView {
                 rs[i].pill = true; rs[i].pillDue = true; rs[i].pillRunning = true
                 rs[i].pillExpired = rem <= 0
                 rs[i].pillFrac = rem <= 0 ? 1 : (total > 0 ? clamp01(Double(rem) / Double(total)) : 1)
-                rs[i].pillTone = rem <= 0 ? 2 : ((rem <= 60 || (total > 0 && rem * 5 <= total)) ? 1 : 0)
+                rs[i].pillTone = rem <= 0 ? 2 : ((rem <= 60 || (total > 0 && rem * 5 <= total)
+                    || (cfg.displayMode == 2 && rem <= cfg.surfaceLead * 60)) ? 1 : 0)
                 rs[i].pillLabel = dueLabel(rs[i].due)
                 hasDuePill = true
             } else if rs[i].type == .todo, let t = timer(for: rs[i].key) {
@@ -1541,6 +1547,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     // 移开后淡入恢复；按住 ⌘ 时保持显示、可正常拖动/勾选/右键。
     var hoverTimer: Timer?
     var hoverHidden = false
+    var hoverAlphaTarget: CGFloat = 1
+    // 智能浮现（显示模式 2）：平时附着桌面；临近截止或定时轻浮现时以“半透明 + 鼠标穿透”浮到最上层，
+    // 悬停更淡、按住 ⌘ 才变实可操作；前台全屏时不浮现（到点提醒除外）。
+    var peekActive = false
+    var peekGlance = false
+    var peekUntil = 0
+    var lastGlance = 0
+    var nextOpenDue = 0
+    var hasOpenItems = false
+    let peekAlpha: CGFloat = 0.7
+    let peekHoverAlpha: CGFloat = 0.18
+    let peekGlanceSec = 8
     var menuTracking = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1611,7 +1629,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     // Window level
     func applyMode() {
-        if cfg.displayMode == 1 {
+        if cfg.displayMode == 1 || (cfg.displayMode == 2 && peekActive) {
             window.level = .floating
         } else {
             window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
@@ -1621,7 +1639,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     // MARK: Hide on hover (always-on-top only)
     func updateHoverHide() {
-        if cfg.hoverHide && cfg.displayMode == 1 {
+        if (cfg.hoverHide && cfg.displayMode == 1) || peekActive {
             if hoverTimer == nil {
                 let t = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in self?.hoverTick() }
                 RunLoop.main.add(t, forMode: .common)   // 拖动/菜单跟踪期间也继续检测
@@ -1638,18 +1656,67 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if ui.alertActive { setHoverHidden(false); return }
         let inside = window.frame.contains(NSEvent.mouseLocation)
         let reveal = NSEvent.modifierFlags.contains(.command)
+        if peekActive {   // 轻浮层：默认半透明且穿透；悬停更淡；按住 ⌘ 才变实可操作
+            let busy = (!hoverHidden && (NSEvent.pressedMouseButtons & 1) != 0) || menuTracking
+            let interactive = reveal || busy
+            setHoverState(clickThrough: !interactive, alpha: interactive ? 1 : (inside ? peekHoverAlpha : peekAlpha))
+            return
+        }
         // 卡片可见时按着左键（正在拖动卡片）不隐藏
         let dragging = !hoverHidden && (NSEvent.pressedMouseButtons & 1) != 0
         setHoverHidden(inside && !reveal && !dragging && !menuTracking)
     }
 
-    func setHoverHidden(_ hidden: Bool) {
-        guard hidden != hoverHidden else { return }
-        hoverHidden = hidden
-        window.ignoresMouseEvents = hidden
+    func setHoverHidden(_ hidden: Bool) { setHoverState(clickThrough: hidden, alpha: hidden ? 0 : 1) }
+
+    func setHoverState(clickThrough: Bool, alpha: CGFloat) {
+        if clickThrough != hoverHidden {
+            hoverHidden = clickThrough
+            window.ignoresMouseEvents = clickThrough
+        }
+        guard alpha != hoverAlphaTarget else { return }
+        let soft = alpha > 0 && alpha < 1
+        hoverAlphaTarget = alpha
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.12
-            self.window.animator().alphaValue = hidden ? 0 : 1
+            ctx.duration = soft ? 0.3 : 0.12
+            self.window.animator().alphaValue = alpha
+        }
+    }
+
+    // 前台是否为全屏程序（此时不做轻浮现）
+    var userIsBusy: Bool {
+        let o = NSApp.currentSystemPresentationOptions
+        return o.contains(.fullScreen) || o.contains(.hideMenuBar)
+    }
+
+    // 每秒随截止时间检查调用：决定是否以轻浮层浮到最上面
+    func updatePeek() {
+        guard cfg.displayMode == 2, !ui.alertActive else {
+            if cfg.displayMode != 2 { peekActive = false; peekGlance = false }
+            return
+        }
+        let now = nowEpoch()
+        if lastGlance == 0 { lastGlance = now }   // 启动后先等一个完整间隔
+        let busy = userIsBusy
+        let upcoming = nextOpenDue > 0 && nextOpenDue - now <= cfg.surfaceLead * 60
+        var glance = false
+        if peekActive && peekGlance && now < peekUntil { glance = true }
+        else if !peekActive && cfg.surfaceEvery > 0 && hasOpenItems && now - lastGlance >= cfg.surfaceEvery * 60 {
+            lastGlance = now
+            if !busy { glance = true; peekUntil = now + peekGlanceSec }
+        }
+        var want = !busy && (upcoming || glance)
+        if peekActive && (menuTracking || (!hoverHidden && (NSEvent.pressedMouseButtons & 1) != 0)) { want = true }
+        if want && !peekActive {
+            peekActive = true
+            peekGlance = !upcoming
+            window.alphaValue = 0; hoverAlphaTarget = 0   // 从透明淡入到轻浮层
+            applyMode()
+            hoverTick()
+            window.orderFrontRegardless()
+        } else if peekActive {
+            if upcoming { peekGlance = false }
+            if !want { peekActive = false; peekGlance = false; applyMode() }
         }
     }
 
@@ -1684,7 +1751,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     func tick() {
         checkDeadlines()
         refresh(force: taskTimers.contains { $0.running && !$0.countdown } || card.hasDuePill)   // 有计时在走：每秒刷新
-        if cfg.displayMode == 1 || ui.alertActive { window.orderFrontRegardless() }
+        if cfg.displayMode == 1 || ui.alertActive || peekActive { window.orderFrontRegardless() }
     }
 
     // Position persistence (top-left, measured down from the top of the main screen)
@@ -1767,10 +1834,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         add(m, "已完成项沉底", #selector(toggleSink), checked: cfg.sinkCompleted)
         m.addItem(.separator())
         let mode = NSMenu()
+        add(mode, "智能浮现（推荐）", #selector(setMode(_:)), 2, checked: cfg.displayMode == 2)
         add(mode, "附着桌面", #selector(setMode(_:)), 0, checked: cfg.displayMode == 0)
         add(mode, "始终置顶", #selector(setMode(_:)), 1, checked: cfg.displayMode == 1)
         mode.addItem(.separator())
-        add(mode, "置顶时悬停隐藏（按住 ⌘ 可操作）", #selector(toggleHoverHide), checked: cfg.hoverHide)
+        let lead = NSMenu()
+        for v in [5, 10, 15, 30] { add(lead, "提前 \(v) 分钟", #selector(setSurfaceLead(_:)), v, checked: cfg.surfaceLead == v) }
+        let every = NSMenu()
+        for v in [30, 45, 60, 0] { add(every, v > 0 ? "每 \(v) 分钟" : "关闭", #selector(setSurfaceEvery(_:)), v, checked: cfg.surfaceEvery == v) }
+        if cfg.displayMode == 2 {
+            submenu(mode, "临近截止时浮现", lead)
+            submenu(mode, "定时轻浮现", every)
+        }
+        add(mode, "置顶时悬停隐藏（按住 ⌘ 可操作）", #selector(toggleHoverHide), checked: cfg.hoverHide, enabled: cfg.displayMode == 1)
         submenu(m, "显示模式", mode)
         add(m, "外观设置…", #selector(showSettings))
         m.addItem(.separator())
@@ -1787,7 +1863,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if settings == nil { settings = SettingsController(app: self) }
         settings?.show(near: NSEvent.mouseLocation)
     }
-    @objc func setMode(_ s: NSMenuItem) { cfg.displayMode = s.tag; applyMode(); saveConfig(); window.orderFrontRegardless() }
+    @objc func setMode(_ s: NSMenuItem) {
+        cfg.displayMode = s.tag
+        peekActive = false; peekGlance = false; lastGlance = nowEpoch()
+        applyMode(); saveConfig(); window.orderFrontRegardless()
+        updatePeek()
+    }
+    @objc func setSurfaceLead(_ s: NSMenuItem) { cfg.surfaceLead = s.tag; saveConfig(); updatePeek(); refresh(force: true) }
+    @objc func setSurfaceEvery(_ s: NSMenuItem) { cfg.surfaceEvery = s.tag; lastGlance = nowEpoch(); saveConfig() }
     @objc func toggleHoverHide() { cfg.hoverHide.toggle(); updateHoverHide(); saveConfig() }
     @objc func toggleShowHidden() { animateLayout { cfg.showHidden.toggle() }; saveConfig() }
     @objc func toggleSink() { cfg.sinkCompleted.toggle(); saveConfig(); refresh(force: true) }
@@ -1907,11 +1990,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             metaChanged = true
             return dueMeta.count - 1
         }
+        var nextDue = 0, openItems = false
         for i in lines.indices {
             var L = parseLine(lines[i])
+            if (L.kind == .todo || L.kind == .countdown) && !L.ok && !L.hide { openItems = true }
             guard (L.kind == .todo || L.kind == .countdown), L.hasDue else { continue }
             let key = itemKey(L)
             let mi = meta(key, L.due)
+            if !L.ok && L.due > now && (nextDue == 0 || L.due < nextDue) { nextDue = L.due }
             if L.ok || dueMeta[mi].fired || now < L.due { continue }
             dueMeta[mi].fired = true; metaChanged = true
             let name = processPlaceholders(trimmed(L.text))
@@ -1934,7 +2020,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if dueMeta.count != before { metaChanged = true }
         if fileChanged { _ = writeTodoLines(lines) }
         if metaChanged { saveDueMeta() }
+        nextOpenDue = nextDue; hasOpenItems = openItems
         for f in fires { startAlert(f.title, f.detail, key: f.key) }
+        updatePeek()
     }
 
     func bannerButtonSpec() -> [(action: BannerAction, title: String)] {
@@ -1977,6 +2065,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         ui.alertTitle = title; ui.alertDetail = detail; ui.alertTaskKey = key
         ui.alertStart = Date(); ui.shakeTimes = 0
         ui.alertActive = true
+        peekActive = false; peekGlance = false   // 醒目提醒接管轻浮层
         setHoverHidden(false)                 // 覆盖悬停隐藏
         window.level = .statusBar             // 附着桌面模式下也临时升到最前端
         refresh(force: true)

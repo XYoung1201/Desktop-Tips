@@ -57,6 +57,9 @@ using namespace std::chrono;
 #define ID_SETTINGS 13
 #define ID_MODE_DESKTOP 14
 #define ID_MODE_TOPMOST 15
+#define ID_MODE_SMART 16
+#define ID_SURFACE_LEAD_FIRST 40   // 40..43：提前 5/10/15/30 分钟浮现
+#define ID_SURFACE_EVERY_FIRST 45  // 45..48：每 30/45/60 分钟轻浮现一次 / 关闭
 #define ID_FONT_SELECT 22
 #define ID_HOVER_HIDE 25
 #define ID_REMINDER_CANCEL 21
@@ -103,7 +106,7 @@ static std::wstring g_fontFamily = L"Microsoft YaHei UI";
 // 显示模式：
 //   0 = 附着桌面（默认）—— 贴在壁纸层(WorkerW)上，Win+D /“显示桌面”不会使其最小化，永远附着。
 //   1 = 始终置顶 —— 浮在所有窗口最上层，Win+D 也不影响，始终保持在最上层。
-static int g_displayMode = 0;
+static int g_displayMode = 2;   // 0 = 附着桌面，1 = 始终置顶，2 = 智能浮现（新安装默认）
 
 // 手动拖动状态：子窗口(WS_CHILD)模式下无法用 HTCAPTION 拖动，需自行处理
 static bool  g_dragging   = false;
@@ -198,6 +201,25 @@ static int  g_hoverAlpha = 255;          // 卡片整体不透明度（用于淡
 static bool g_contextMenuOpen = false;   // 右键菜单弹出期间不隐藏
 static const int HOVER_HIDE_POLL_MS = 30;
 static const int HOVER_HIDE_FADE_STEP = 64;   // 每次 tick 的 alpha 变化量（约 120ms 完成淡入/淡出）
+// 智能浮现（显示模式 2）：
+//   平时附着桌面，不打扰；有事时才以“半透明 + 鼠标穿透”的轻浮层浮到最上面：
+//     · 某项截止时间进入提前量（SurfaceLead 分钟）→ 浮现直到处理或到点（到点后走原有的醒目提醒）；
+//     · 每隔 SurfaceEvery 分钟（有未完成事项时）轻浮现 8 秒，扫一眼即沉回桌面。
+//   浮现时不抢焦点、不挡点击；鼠标移上去会更淡，按住 Ctrl 才变实、可勾选/拖动。
+//   前台是全屏程序或演示模式时不浮现（到点提醒除外）。
+static int  g_surfaceLeadMin = 10;      // 配置键 SurfaceLead
+static int  g_surfaceEveryMin = 45;     // 配置键 SurfaceEvery，0 = 关闭定时轻浮现
+static bool g_peekActive = false;       // 当前是否浮在最上层（轻浮层）
+static bool g_peekGlance = false;       // true = 定时轻浮现（会自动沉回）
+static long long g_peekUntil = 0;
+static long long g_lastGlance = 0;
+static long long g_nextOpenDue = 0;     // 最近一个未完成且尚未到点的截止时间（0 = 无）
+static bool g_hasOpenItems = false;
+static const int PEEK_ALPHA = 178;      // 轻浮层的整体不透明度
+static const int PEEK_HOVER_ALPHA = 46; // 鼠标停在轻浮层上时
+static const int PEEK_GLANCE_SEC = 8;
+static const int kSurfaceLeadOpts[] = { 5, 10, 15, 30 };
+static const int kSurfaceEveryOpts[] = { 30, 45, 60, 0 };
 
 #define MAX_LOADSTRING 100
 
@@ -217,6 +239,7 @@ void confWrite();
 
 void FindWorkerW();
 void ApplyDisplayMode(HWND hwnd, int mode);
+static void UpdatePeek(HWND hwnd);
 
 HWND g_hWorkerW = NULL;
 // 重新设置父窗口(SetParent)期间置 true：此时系统会先隐藏窗口再重挂父子关系，
@@ -924,7 +947,7 @@ static std::vector<std::wstring> SplitWide(const std::wstring& text, wchar_t sep
 
 static bool HoverHideActive()
 {
-    return g_hoverHideEnabled && g_displayMode == 1 && !g_alertActive && !g_restoringAlert;
+    return ((g_hoverHideEnabled && g_displayMode == 1) || g_peekActive) && !g_alertActive && !g_restoringAlert;
 }
 
 static void SetClickThrough(HWND hwnd, bool on)
@@ -968,14 +991,22 @@ static void TickHoverHide(HWND hwnd)
     bool inside = PtInRect(&wr, pt) != FALSE;
     bool reveal = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;   // 按住 Ctrl：显示并可操作
     bool busy = g_dragging || g_contextMenuOpen || GetCapture() == hwnd;
-    bool wantHidden = inside && !reveal && !busy;
+    bool wantHidden;   // true = 鼠标穿透
+    int target;
+    if (g_peekActive) {   // 轻浮层：默认半透明且穿透；悬停更淡；按住 Ctrl 才变实可操作
+        bool interactive = reveal || busy;
+        wantHidden = !interactive;
+        target = interactive ? 255 : (inside ? PEEK_HOVER_ALPHA : PEEK_ALPHA);
+    } else {
+        wantHidden = inside && !reveal && !busy;
+        target = wantHidden ? 0 : 255;
+    }
 
     if (wantHidden != g_hoverHidden) {
         g_hoverHidden = wantHidden;
         SetClickThrough(hwnd, wantHidden);
     }
 
-    int target = wantHidden ? 0 : 255;
     if (g_hoverAlpha != target) {
         if (target > g_hoverAlpha) g_hoverAlpha = (std::min)(target, g_hoverAlpha + HOVER_HIDE_FADE_STEP);
         else                       g_hoverAlpha = (std::max)(target, g_hoverAlpha - HOVER_HIDE_FADE_STEP);
@@ -1439,6 +1470,8 @@ static void StartCardAlert(HWND hwnd, const std::wstring& title, const std::wstr
     g_shakeTimes = 0;
     if (!g_alertActive) {
         g_alertActive = true;
+        g_peekActive = false;   // 醒目提醒接管轻浮层
+        g_peekGlance = false;
         ResetHoverHide(hwnd);   // 覆盖悬停隐藏：立即完全显示且可点击
     }
     RaiseForAlert(hwnd);
@@ -1460,6 +1493,58 @@ static void StopCardAlert(HWND hwnd)
     UpdateHoverHideTimer(hwnd);
     confWrite();
     SetAnimTimer(hwnd);
+}
+
+// 前台是否处于全屏 / 演示 / 免打扰（此时不做轻浮现）
+static bool UserIsBusy()
+{
+    QUERY_USER_NOTIFICATION_STATE st;
+    if (FAILED(SHQueryUserNotificationState(&st))) return false;
+    return st == QUNS_BUSY || st == QUNS_RUNNING_D3D_FULL_SCREEN || st == QUNS_PRESENTATION_MODE;
+}
+
+static void EndPeek(HWND hwnd)
+{
+    if (!g_peekActive) return;
+    g_peekActive = false;
+    g_peekGlance = false;
+    ApplyDisplayMode(hwnd, g_displayMode);   // 沉回桌面层，并恢复完全不透明、可点击
+}
+
+// 智能浮现：每秒随截止时间检查一起调用，决定是否以轻浮层浮到最上面
+static void UpdatePeek(HWND hwnd)
+{
+    if (g_displayMode != 2 || g_alertActive || g_restoringAlert) {
+        if (g_displayMode != 2) { g_peekActive = false; g_peekGlance = false; }
+        return;   // 提醒期间由提醒接管层级，结束后 StopCardAlert 会恢复显示模式
+    }
+    long long now = NowEpoch();
+    if (g_lastGlance == 0) g_lastGlance = now;   // 启动后先等一个完整间隔
+    bool busy = UserIsBusy();
+    bool upcoming = g_nextOpenDue > 0 && g_nextOpenDue - now <= (long long)g_surfaceLeadMin * 60;
+    bool glance = false;
+    if (g_peekActive && g_peekGlance && now < g_peekUntil) glance = true;
+    else if (!g_peekActive && g_surfaceEveryMin > 0 && g_hasOpenItems
+             && now - g_lastGlance >= (long long)g_surfaceEveryMin * 60) {
+        g_lastGlance = now;
+        if (!busy) { glance = true; g_peekUntil = now + PEEK_GLANCE_SEC; }
+    }
+    bool want = !busy && (upcoming || glance);
+    if (g_dragging || g_contextMenuOpen) want = g_peekActive;   // 操作中不切换层级
+    if (want && !g_peekActive) {
+        g_peekActive = true;
+        g_peekGlance = !upcoming;
+        g_hoverAlpha = 0;                 // 从透明淡入到轻浮层
+        RaiseForAlert(hwnd);
+        RenderTip(hwnd);
+        g_hoverHidden = false;
+        UpdateHoverHideTimer(hwnd);
+        SetClickThrough(hwnd, true);
+        g_hoverHidden = true;
+    } else if (g_peekActive) {
+        if (upcoming) g_peekGlance = false;
+        if (!want) EndPeek(hwnd);
+    }
 }
 
 // 每秒检查截止时间是否已到（任务与独立倒计时共用）
@@ -1487,11 +1572,15 @@ static void CheckDeadlines(HWND hwnd)
         return (size_t)i;
     };
 
+    long long nextDue = 0;
+    bool openItems = false;
     for (size_t i = 0; i < lines.size(); ++i) {
         LineInfo L = ParseLine(lines[i]);
+        if ((L.kind == LK_TODO || L.kind == LK_COUNTDOWN) && !L.ok && !L.hide) openItems = true;
         if ((L.kind != LK_TODO && L.kind != LK_COUNTDOWN) || !L.hasDue) continue;
         std::wstring key = ItemKey(L);
         size_t mi = meta(key, L.due);
+        if (!L.ok && L.due > now && (nextDue == 0 || L.due < nextDue)) nextDue = L.due;
         if (L.ok || g_dueMeta[mi].fired || now < L.due) continue;
         g_dueMeta[mi].fired = true;
         metaChanged = true;
@@ -1525,7 +1614,10 @@ static void CheckDeadlines(HWND hwnd)
     if (g_dueMeta.size() != before) metaChanged = true;
     if (fileChanged) WriteTodoFileLinesW(lines);
     if (metaChanged) SaveDueMeta();
+    g_nextOpenDue = nextDue;
+    g_hasOpenItems = openItems;
     for (const auto& f : fires) StartCardAlert(hwnd, f.title, f.detail, f.key);
+    UpdatePeek(hwnd);
 }
 
 static std::vector<std::pair<int, std::wstring>> BannerButtonSpec()
@@ -2338,10 +2430,26 @@ void ShowContextMenu(HWND hwnd, bool fromCard = false) {
     AppendMenuW(hMenu, MF_STRING | (g_sinkCompleted ? MF_CHECKED : MF_UNCHECKED), ID_SINK_DONE, L"已完成项沉底");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     HMENU hModeMenu = CreatePopupMenu();
+    AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 2 ? MF_CHECKED : MF_UNCHECKED), ID_MODE_SMART, L"智能浮现（推荐）");
     AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 0 ? MF_CHECKED : MF_UNCHECKED), ID_MODE_DESKTOP, L"附着桌面");
     AppendMenuW(hModeMenu, MF_STRING | (g_displayMode == 1 ? MF_CHECKED : MF_UNCHECKED), ID_MODE_TOPMOST, L"始终置顶");
     AppendMenuW(hModeMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED),
+    {
+        UINT dis = g_displayMode == 2 ? 0 : MF_GRAYED;
+        HMENU hLead = CreatePopupMenu();
+        for (int i = 0; i < 4; ++i) {
+            std::wstring t = L"提前 " + std::to_wstring(kSurfaceLeadOpts[i]) + L" 分钟";
+            AppendMenuW(hLead, MF_STRING | (g_surfaceLeadMin == kSurfaceLeadOpts[i] ? MF_CHECKED : 0), ID_SURFACE_LEAD_FIRST + i, t.c_str());
+        }
+        AppendMenuW(hModeMenu, MF_POPUP | dis, (UINT_PTR)hLead, L"临近截止时浮现");
+        HMENU hEvery = CreatePopupMenu();
+        for (int i = 0; i < 4; ++i) {
+            std::wstring t = kSurfaceEveryOpts[i] ? (L"每 " + std::to_wstring(kSurfaceEveryOpts[i]) + L" 分钟") : std::wstring(L"关闭");
+            AppendMenuW(hEvery, MF_STRING | (g_surfaceEveryMin == kSurfaceEveryOpts[i] ? MF_CHECKED : 0), ID_SURFACE_EVERY_FIRST + i, t.c_str());
+        }
+        AppendMenuW(hModeMenu, MF_POPUP | dis, (UINT_PTR)hEvery, L"定时轻浮现");
+    }
+    AppendMenuW(hModeMenu, MF_STRING | (g_hoverHideEnabled ? MF_CHECKED : MF_UNCHECKED) | (g_displayMode == 1 ? 0 : MF_GRAYED),
         ID_HOVER_HIDE, L"置顶时悬停隐藏（按住 Ctrl 可操作）");
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"显示模式");
     AppendMenuW(hMenu, MF_STRING, ID_SETTINGS, L"外观设置…");
@@ -2514,6 +2622,8 @@ void confWrite() {
     ofs << "DisplayMode: " << g_displayMode << std::endl;
     ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
     ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+    ofs << "SurfaceLead: " << g_surfaceLeadMin << std::endl;
+    ofs << "SurfaceEvery: " << g_surfaceEveryMin << std::endl;
     ofs << "ShowHidden: " << (g_showHidden ? 1 : 0) << std::endl;
     ofs << "SinkCompleted: " << (g_sinkCompleted ? 1 : 0) << std::endl;
     ofs << "DueDisplay: " << (g_dueShowAbsolute ? 1 : 0) << std::endl;
@@ -2850,7 +2960,8 @@ void RenderTip(HWND hwnd)
             r.pill = true; r.pillDue = true; r.pillRunning = true;
             r.pillExpired = rem <= 0;
             r.pillFrac = rem <= 0 ? 1.0 : (total > 0 ? Clamp01((double)rem / (double)total) : 1.0);
-            r.pillTone = rem <= 0 ? 2 : ((rem <= 60 || (total > 0 && rem * 5 <= total)) ? 1 : 0);
+            r.pillTone = rem <= 0 ? 2 : ((rem <= 60 || (total > 0 && rem * 5 <= total)
+                || (g_displayMode == 2 && rem <= (long long)g_surfaceLeadMin * 60)) ? 1 : 0);
             r.pillLabel = dueLabel(r.due);
             g_hasDuePill = true;
         } else if (r.type == RT_TODO) {
@@ -3512,12 +3623,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ChooseFontFamily(hWnd);
         }
         if (LOWORD(wParam) == ID_MODE_DESKTOP) {
-            g_displayMode = 0;          // 附着桌面（默认）
+            g_displayMode = 0;          // 附着桌面
+            g_peekActive = false;
             confWrite();
             ApplyDisplayMode(hWnd, 0);
         }
+        if (LOWORD(wParam) == ID_MODE_SMART) {
+            g_displayMode = 2;          // 智能浮现
+            g_peekActive = false;
+            g_lastGlance = NowEpoch();
+            confWrite();
+            ApplyDisplayMode(hWnd, 2);
+            UpdatePeek(hWnd);
+        }
+        if (LOWORD(wParam) >= ID_SURFACE_LEAD_FIRST && LOWORD(wParam) < ID_SURFACE_LEAD_FIRST + 4) {
+            g_surfaceLeadMin = kSurfaceLeadOpts[LOWORD(wParam) - ID_SURFACE_LEAD_FIRST];
+            confWrite();
+            UpdatePeek(hWnd);
+            RenderTip(hWnd);
+        }
+        if (LOWORD(wParam) >= ID_SURFACE_EVERY_FIRST && LOWORD(wParam) < ID_SURFACE_EVERY_FIRST + 4) {
+            g_surfaceEveryMin = kSurfaceEveryOpts[LOWORD(wParam) - ID_SURFACE_EVERY_FIRST];
+            g_lastGlance = NowEpoch();
+            confWrite();
+        }
         if (LOWORD(wParam) == ID_MODE_TOPMOST) {
             g_displayMode = 1;          // 始终置顶
+            g_peekActive = false;
             confWrite();
             ApplyDisplayMode(hWnd, 1);
         }
@@ -3686,7 +3818,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     case WM_TIMER:
         if (wParam == TIMER_REFRESH) {
-            if (g_displayMode == 1) {
+            if (g_displayMode == 1 || g_peekActive) {
                 // 周期性重新置顶：防止个别全屏/置顶程序抢走最上层
                 SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -3769,7 +3901,10 @@ void ApplyDisplayMode(HWND hwnd, int mode) {
     }
     SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);
 
-    if (mode == 1) {
+    if (mode == 2 && g_peekActive) {
+        // —— 智能浮现：正处于轻浮层 ——
+        RaiseForAlert(hwnd);
+    } else if (mode == 1) {
         // —— 始终置顶 ——
         ex |= WS_EX_TOPMOST;
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
@@ -3793,7 +3928,7 @@ void ApplyDisplayMode(HWND hwnd, int mode) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
     RenderTip(hwnd);   // 绑定/层级变化后重绘（UpdateLayeredWindow 会按屏幕坐标重新定位）
-    UpdateHoverHideTimer(hwnd);   // 仅「始终置顶」且开启设置时启用悬停隐藏
+    UpdateHoverHideTimer(hwnd);   // 「始终置顶」+ 设置开启，或智能浮现的轻浮层时启用
 }
 
 // 探测“现代独立壁纸层 WorkerW”：即 0x052C 之后由 Explorer 创建、与承载 SHELLDLL_DefView 的
@@ -3914,6 +4049,8 @@ void confCreate() {
         ofs << "DisplayMode: " << g_displayMode << std::endl;
         ofs << "CountdownRepeat: " << (g_countdownRepeatEnabled ? 1 : 0) << std::endl;
         ofs << "HoverHide: " << (g_hoverHideEnabled ? 1 : 0) << std::endl;
+        ofs << "SurfaceLead: " << g_surfaceLeadMin << std::endl;
+        ofs << "SurfaceEvery: " << g_surfaceEveryMin << std::endl;
     ofs << "ShowHidden: " << (g_showHidden ? 1 : 0) << std::endl;
     ofs << "SinkCompleted: " << (g_sinkCompleted ? 1 : 0) << std::endl;
     ofs << "DueDisplay: " << (g_dueShowAbsolute ? 1 : 0) << std::endl;
@@ -3980,6 +4117,12 @@ void readFromFile(int& x, int& y) {
         }
         else if (line.find("CountdownRepeat:") == 0) {
             g_countdownRepeatEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
+        }
+        else if (line.find("SurfaceLead:") == 0) {
+            try { g_surfaceLeadMin = (std::max)(1, std::stoi(line.substr(line.find(":") + 1))); } catch (...) {}
+        }
+        else if (line.find("SurfaceEvery:") == 0) {
+            try { g_surfaceEveryMin = (std::max)(0, std::stoi(line.substr(line.find(":") + 1))); } catch (...) {}
         }
         else if (line.find("HoverHide:") == 0) {
             g_hoverHideEnabled = (std::stoi(line.substr(line.find(":") + 2)) != 0);
