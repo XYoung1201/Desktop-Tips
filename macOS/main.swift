@@ -968,6 +968,162 @@ final class SettingsController: NSObject {
     }
 }
 
+// MARK: - Built-in TODO editor
+// 双击卡片时用内置窗口编辑 TODO，而不是交给「文本编辑」：TODO 文件放在 OneDrive / iCloud 等
+// 云盘目录（~/Library/CloudStorage）时，「文本编辑」保存会与它的接力（Handoff）活动互相等待，
+// 整个程序卡死、内容也存不下来。内置编辑器直接写文件，不经过 NSDocument。
+
+/// 无主菜单的 accessory 程序收不到 ⌘C/⌘V/⌘S 等快捷键，这里手动转发
+final class EditorPanel: NSPanel {
+    var onSave: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let shift = flags.contains(.shift)
+        var action: Selector?
+        switch key {
+        case "s": onSave?(); return true
+        case "w": performClose(nil); return true
+        case "x": action = #selector(NSText.cut(_:))
+        case "c": action = #selector(NSText.copy(_:))
+        case "v": action = #selector(NSText.paste(_:))
+        case "a": action = #selector(NSText.selectAll(_:))
+        case "z": action = shift ? Selector(("redo:")) : Selector(("undo:"))
+        default: break
+        }
+        if let action, NSApp.sendAction(action, to: nil, from: self) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+final class TodoEditor: NSObject, NSWindowDelegate, NSTextViewDelegate {
+    let panel: EditorPanel
+    let textView: NSTextView
+    weak var app: AppController?
+    var loadedText = ""          // 打开/上次保存时磁盘上的内容
+    var dirty = false
+
+    init(app: AppController) {
+        self.app = app
+        panel = EditorPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+                            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        panel.level = .floating
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.minSize = NSSize(width: 320, height: 220)
+        let scroll = NSTextView.scrollableTextView()
+        textView = scroll.documentView as! NSTextView
+        super.init()
+        let v = panel.contentView!
+        let save = NSButton(title: "保存  Save (⌘S)", target: self, action: #selector(saveAction))
+        save.keyEquivalent = "\r"; save.keyEquivalentModifierMask = [.command]
+        let hint = NSTextField(labelWithString: "# 标题　> 次要　- 待办　行尾 _OK = 已完成")
+        hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 11)
+        for x in [scroll, save, hint] as [NSView] { x.translatesAutoresizingMaskIntoConstraints = false; v.addSubview(x) }
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: v.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -10),
+            save.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -12),
+            save.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -10),
+            hint.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
+            hint.centerYAnchor.constraint(equalTo: save.centerYAnchor),
+            hint.trailingAnchor.constraint(lessThanOrEqualTo: save.leadingAnchor, constant: -8),
+        ])
+        textView.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.delegate = self
+        panel.delegate = self
+        panel.onSave = { [weak self] in self?.save() }
+    }
+
+    func diskText() -> String? {
+        FileManager.default.contents(atPath: cfg.todoPath).map(decodeText)
+    }
+
+    func load() {
+        loadedText = diskText() ?? ""
+        textView.string = loadedText
+        textView.undoManager?.removeAllActions()
+        setDirty(false)
+    }
+
+    func setDirty(_ d: Bool) {
+        dirty = d
+        panel.isDocumentEdited = d
+        panel.title = (cfg.todoPath as NSString).lastPathComponent + (d ? " — 已修改" : "")
+    }
+
+    func show() {
+        if !panel.isVisible || !dirty { load() }
+        if !panel.isVisible {
+            if let scr = NSScreen.main {
+                let f = scr.visibleFrame
+                panel.setFrameOrigin(NSPoint(x: f.midX - panel.frame.width / 2, y: f.midY - panel.frame.height / 2))
+            }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(textView)
+    }
+
+    /// 卡片上勾选等操作改了文件：未编辑时同步到编辑器
+    func fileChangedOnDisk() {
+        guard panel.isVisible, !dirty, let t = diskText(), t != loadedText else { return }
+        let sel = textView.selectedRange()
+        loadedText = t; textView.string = t
+        textView.setSelectedRange(NSRange(location: min(sel.location, (t as NSString).length), length: 0))
+    }
+
+    func textDidChange(_ notification: Notification) { setDirty(textView.string != loadedText) }
+
+    @objc func saveAction() { save() }
+
+    @discardableResult
+    func save() -> Bool {
+        let text = textView.string
+        if let now = diskText(), now != loadedText, now != text {
+            let a = NSAlert()
+            a.messageText = "文件已在别处被修改"
+            a.informativeText = "保存会覆盖这些修改。"
+            a.addButton(withTitle: "覆盖保存"); a.addButton(withTitle: "取消")
+            if a.runModal() != .alertFirstButtonReturn { return false }
+        }
+        do {
+            try text.write(toFile: cfg.todoPath, atomically: true, encoding: .utf8)
+        } catch {
+            let a = NSAlert(); a.messageText = "保存失败"; a.informativeText = error.localizedDescription; a.runModal()
+            return false
+        }
+        loadedText = text
+        setDirty(false)
+        app?.refresh(force: true)
+        return true
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard dirty else { return true }
+        let a = NSAlert()
+        a.messageText = "保存对 TODO 的修改吗？"
+        a.addButton(withTitle: "保存"); a.addButton(withTitle: "取消"); a.addButton(withTitle: "不保存")
+        switch a.runModal() {
+        case .alertFirstButtonReturn: return save()
+        case .alertThirdButtonReturn: setDirty(false); return true
+        default: return false
+        }
+    }
+}
+
 // MARK: - App controller
 
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
@@ -975,6 +1131,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     var card: CardView!
     var statusItem: NSStatusItem!
     var settings: SettingsController?
+    var editor: TodoEditor?
     var lastMTime: Date?
 
     // 动画（完成动画 / 行滑动 / 抖动 / 提醒横幅呼吸光）
@@ -1091,6 +1248,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let minute = Calendar.current.component(.minute, from: Date()) * 60 + Calendar.current.component(.second, from: Date())
         _ = minute
         if !force && sig == lastMTime && !contentHasPlaceholders { return }
+        if sig != lastMTime { editor?.fileChangedOnDisk() }
         lastMTime = sig
         let size = card.relayout()
         let top = NSPoint(x: window.frame.minX, y: window.frame.maxY)
@@ -1205,6 +1363,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let mi = NSMenuItem(title: "显示模式  Display mode", action: nil, keyEquivalent: ""); mi.submenu = mode; m.addItem(mi)
         m.addItem(.separator())
         add(m, "编辑 TODO  Edit", #selector(editTodoAction))
+        add(m, "用默认应用打开  Open in default app", #selector(openExternally))
         add(m, "刷新  Refresh", #selector(refreshAction))
         add(m, "更换 TODO 文件  Change file", #selector(changeFile))
         add(m, "在访达中显示  Reveal in Finder", #selector(reveal))
@@ -1222,9 +1381,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc func toggleHoverHide() { cfg.hoverHide.toggle(); updateHoverHide(); saveConfig() }
     @objc func refreshAction() { refresh(force: true) }
     @objc func editTodoAction() { editTodo() }
-    func editTodo() { NSWorkspace.shared.open(URL(fileURLWithPath: cfg.todoPath)) }
+    func editTodo() {
+        if editor == nil { editor = TodoEditor(app: self) }
+        editor?.show()
+    }
+    @objc func openExternally() { NSWorkspace.shared.open(URL(fileURLWithPath: cfg.todoPath)) }
     @objc func reveal() { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cfg.todoPath)]) }
-    @objc func quit() { saveConfig(); NSApp.terminate(nil) }
+    @objc func quit() {
+        if let e = editor, e.panel.isVisible, !e.windowShouldClose(e.panel) { return }
+        saveConfig(); NSApp.terminate(nil)
+    }
 
     @objc func changeFile() {
         let p = NSOpenPanel()
